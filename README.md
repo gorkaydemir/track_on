@@ -118,7 +118,7 @@ A multi-node training script is provided in [`train.sh`](scripts/train.sh). Defa
 If you find our work useful, please cite:
 ```bibtex
 @InProceedings{Aydemir2025ICLR,
-    author    = {Aydemir, G"orkay and Cai, Xiongyi and Xie, Weidi and G"uney, Fatma},
+    author    = {Aydemir, G\"orkay and Cai, Xiongyi and Xie, Weidi and G\"uney, Fatma},
     title     = {{Track-On}: Transformer-based Online Point Tracking with Memory},
     booktitle = {The Thirteenth International Conference on Learning Representations},
     year      = {2025}
