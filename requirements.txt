@@ -1,0 +1,6 @@
+tqdm==4.67.1
+wandb==0.17.9
+mediapy==1.2.2
+timm==1.0.12
+imageio==2.37.0
+imageio[ffmpeg]==0.6.0
