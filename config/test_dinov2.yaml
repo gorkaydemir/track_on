@@ -1,0 +1,12 @@
+input_size: [384, 512]
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: "dinov2_s"
+vit_upsample_factor: 1.0
+M_i: 72
+delta_v: 0.8
+grad_checkpoint: True

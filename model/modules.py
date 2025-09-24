@@ -9,53 +9,56 @@ import torchvision.ops
 from mmcv.ops import MultiScaleDeformableAttention
 
 
-
-# Attention Block
 class MHA_Block(nn.Module):
     def __init__(self, hidden_size, num_heads, attn_drop=0.1, mlp_drop=0.1):
         super().__init__()
 
         self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        self.attn_drop = attn_drop
+
         self.mha = nn.MultiheadAttention(hidden_size, num_heads, attn_drop, batch_first=True)
+
         self.linear1 = nn.Linear(hidden_size, 4 * hidden_size)
         self.dropout = nn.Dropout(mlp_drop)
         self.linear2 = nn.Linear(4 * hidden_size, hidden_size)
-
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
         self.dropout1 = nn.Dropout(mlp_drop)
         self.dropout2 = nn.Dropout(mlp_drop)
-    
 
-    def forward(self, q, k=None, v=None, mask=None, full_attn_mask=None):
-        # :args q: (B, N, C)
-        # :args kv: (B, P, C)
+        norm_cls = nn.LayerNorm
+        self.norm1 = norm_cls(hidden_size)
+        self.norm2 = norm_cls(hidden_size)
 
-        if k is None:
-            k = q
-            
-        if v is None:
-            v = k
+        self.act = nn.ReLU(inplace=True)
 
+    def forward(self, q, k, v, mask=None):
+        # q, k, v: (B, T, C), mask: (B, P), where True = ignore
         B, N, C = q.shape
-        B, P, C = k.shape
+        _, P, _ = k.shape
 
         if mask is not None:
-            assert mask.shape == (B, P), f"Mask shape: {mask.shape} expected: {(B, P)}"
-            # assert full_attn_mask is None, "Cannot use both mask and full_attn_mask"
+            assert mask.shape == (B, P), f"Mask shape: {mask.shape} expected {(B, P)}"
+            full_mask = mask.all(dim=1)  # (B,)
 
-        if full_attn_mask is not None:
-            assert full_attn_mask.shape == (B * self.num_heads, N, P), f"Full mask shape: {full_attn_mask.shape} expected: {(B * self.num_heads, N, P)}"
-            # assert mask is None, "Cannot use both mask and full_attn_mask"
+        q_orig = q
+        attn_out, _ = self.mha(q, k, v, key_padding_mask=mask, need_weights=False)
 
-        q = q + self.dropout1(self.mha(q, k, v, key_padding_mask=mask, attn_mask=full_attn_mask, need_weights=False)[0])
+        drop = self.dropout1(attn_out)
+
+        if mask is not None and full_mask.any():
+            drop[full_mask] = 0
+
+        q = q_orig + drop
         q = self.norm1(q)
-        q = q + self.dropout2(self.linear2(self.dropout(F.relu(self.linear1(q)))))
+
+        ffn = self.linear2(self.dropout(self.act(self.linear1(q))))
+        q = q + self.dropout2(ffn)
         q = self.norm2(q)
+
 
         return q
     
-
 # Deformable Multi Scale Attention Block
 class DMSMHA_Block(nn.Module):
     def __init__(self, hidden_size, num_heads, num_levels, p_drop=0.1):
@@ -74,10 +77,15 @@ class DMSMHA_Block(nn.Module):
         self.dropout = nn.Dropout(p_drop)
         self.linear2 = nn.Linear(4 * hidden_size, hidden_size)
 
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
         self.dropout1 = nn.Dropout(p_drop)
         self.dropout2 = nn.Dropout(p_drop)
+
+        norm_cls = nn.LayerNorm
+        self.norm1 = norm_cls(hidden_size)
+        self.norm2 = norm_cls(hidden_size)
+
+        self.act = nn.ReLU(inplace=True)
+
 
     def forward(self, q, k, v, reference_points, spatial_shapes, start_levels):
         # :args q: (B, N, C)
@@ -93,102 +101,64 @@ class DMSMHA_Block(nn.Module):
 
         q = q + self.dropout1(self.mha(q, k, v, reference_points=reference_points, spatial_shapes=spatial_shapes, level_start_index=start_levels))
         q = self.norm1(q)
-        q = q + self.dropout2(self.linear2(self.dropout(F.relu(self.linear1(q)))))
+        q = q + self.dropout2(self.linear2(self.dropout(self.act(self.linear1(q)))))
         q = self.norm2(q)
 
         return q
 
 
-class Token_Decoder(nn.Module):
-    def __init__(self, args, use_norm=False):
+class SimpleFPN(nn.Module):
+    def __init__(self, args):
         super().__init__()
 
-        hidden_size = args.transformer_embedding_dim
+        self.D = args.D
+        self.size = args.input_size
+        self.stride = 4
 
-        # linear - layer norm - relu - linear - layer norm - relu - linear
-        self.linear1 = nn.Linear(hidden_size, hidden_size)
-        self.linear2 = nn.Linear(hidden_size, hidden_size)
-        self.linear3 = nn.Linear(hidden_size, hidden_size)
-        self.linear4 = nn.Linear(hidden_size, hidden_size)
+        self.H = self.size[0]
+        self.W = self.size[1]
+        self.Hf = self.H // self.stride
+        self.Wf = self.W // self.stride
+        self.P = int(self.Hf * self.Wf)                     # Number of tokens
 
-        if use_norm:
-            self.norm1 = nn.LayerNorm(hidden_size)
-            self.norm2 = nn.LayerNorm(hidden_size)
-            self.norm3 = nn.LayerNorm(hidden_size)
-        else:
-            self.norm1 = nn.Identity()
-            self.norm2 = nn.Identity()
-            self.norm3 = nn.Identity()
-        
-    def forward(self, x):
-        # :args x: (B, P, C)
+        def block(in_channels):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, self.D, kernel_size=1),
+                nn.GroupNorm(32, self.D),
+                nn.ReLU()
+            )
+
+        self.lateral32 = block(self.D)
+        self.lateral16 = block(self.D)
+        self.lateral8 = block(self.D)
+
+        self.output = nn.Sequential(nn.Conv2d(self.D, self.D, kernel_size=3, padding=1),
+                                    nn.GroupNorm(32, self.D),
+                                    nn.ReLU(),
+                                    nn.Conv2d(self.D, self.D, kernel_size=3, padding=1))
+
+
+    def forward(self, f4, f8, f16, f32):
+        # :args f4: (B, T, P, D)
+        # :args f8: (B, T, P // 4, D)
+        # :args f16: (B, T, P // 16, D)
+        # :args f32: (B, T, P // 64, D)
         #
-        # :return x: (B, P, C)
+        # :return out: (B, T, P, D)
 
-        B, P, C = x.shape
+        B, T, _, _ = f4.shape
 
-        identity = x
-        out = self.linear1(x)
-        out = self.norm1(out)
-        out = F.relu(out + identity)
+        f4 = f4.permute(0, 1, 3, 2).reshape(B * T, self.D, self.Hf, self.Wf)               # (B * T, D, Hf, Wf)
+        f8 = f8.permute(0, 1, 3, 2).reshape(B * T, self.D, self.Hf // 2, self.Wf // 2)     # (B * T, D, Hf // 2, Wf // 2)
+        f16 = f16.permute(0, 1, 3, 2).reshape(B * T, self.D, self.Hf // 4, self.Wf // 4)   # (B * T, D, Hf // 4, Wf // 4)
+        f32 = f32.permute(0, 1, 3, 2).reshape(B * T, self.D, self.Hf // 8, self.Wf // 8)   # (B * T, D, Hf // 8, Wf // 8)
 
-        identity = out
-        out = self.linear2(out)
-        out = self.norm2(out)
-        out = F.relu(out + identity)
+        f32_lat = self.lateral32(f32)                                                                   # (B * T, D, Hf // 8, Wf // 8)
+        f16_lat = self.lateral16(f16) + F.interpolate(f32_lat, size=f16.shape[-2:], mode="nearest")     # (B * T, D, Hf // 4, Wf // 4)
+        f8_lat = self.lateral8(f8) + F.interpolate(f16_lat, size=f8.shape[-2:], mode="nearest")         # (B * T, D, Hf // 2, Wf // 2)
+        f4_out = f4 + F.interpolate(f8_lat, size=f4.shape[-2:], mode="nearest")                         # (B * T, D, Hf, Wf)
 
-        identity = out
-        out = self.linear3(out)
-        out = self.norm3(out)
-        out = F.relu(out + identity)
+        f4_out = self.output(f4_out)                                                                    # (B * T, D, Hf, Wf)
+        f4_out = f4_out.permute(0, 2, 3, 1).reshape(B, T, self.P, self.D)                               # (B, T, P, D)
 
-        x = self.linear4(out)
-
-        return x
-    
-
-def get_deformable_inputs(f_t, target_coordinates, H_prime, W_prime):
-    # 4 level of features
-    # :args f_t: (B, P, C)
-    # :args target_coordinates: (B, N, 2), in [0, 1]
-    # :args H_prime: int
-    # :args W_prime: int
-
-    B, P, C = f_t.shape
-    num_level = 4
-
-    # === Features ===
-    f1 = f_t.view(B, H_prime, W_prime, C).permute(0, 3, 1, 2)  # (B, C, H, W)
-    f2 =  F.avg_pool2d(f1, kernel_size=2, stride=2)                      # (B, C, H // 2, W // 2)
-    f3 =  F.avg_pool2d(f1, kernel_size=4, stride=4)                      # (B, C, H // 4, W // 4)
-    f4 =  F.avg_pool2d(f1, kernel_size=8, stride=8)                      # (B, C, H // 8, W // 8)
-
-    f1 = f1.view(B, C, H_prime * W_prime).permute(0, 2, 1)     # (B, P, C)
-    f2 = f2.view(B, C, (H_prime // 2) * (W_prime // 2)).permute(0, 2, 1)  # (B, P // 4, C)
-    f3 = f3.view(B, C, (H_prime // 4) * (W_prime // 4)).permute(0, 2, 1)  # (B, P // 16, C)
-    f4 = f4.view(B, C, (H_prime // 8) * (W_prime // 8)).permute(0, 2, 1)  # (B, P // 64, C)
-
-    f_scales = [f1, f2, f3, f4]
-    f_scales = torch.cat(f_scales, dim=1)   # (B, P + P // 4 + P // 16 + P // 64, C)    
-
-
-    # === Reference Points ===
-    reference_points = target_coordinates.unsqueeze(2).expand(-1, -1, num_level, -1) # (B, N, num_level, 2)
-
-    # === Spatial Shapes ===
-    spatial_shapes = [(H_prime, W_prime), 
-                      (H_prime // 2, W_prime // 2), 
-                      (H_prime // 4, W_prime // 4), 
-                      (H_prime // 8, W_prime // 8)]
-    
-    spatial_shapes = torch.tensor(spatial_shapes, device=f_t.device) # (num_level, 2)
-
-    # === Start Levels ===
-    start_levels = torch.tensor([0, 
-                                 P, 
-                                 P + P // 4, 
-                                 P + P // 4 + P // 16], device=f_t.device) # (num_level,)
-    
-    return f_scales, reference_points, spatial_shapes, start_levels
-
-
+        return f4_out

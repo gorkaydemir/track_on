@@ -6,184 +6,112 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from dino_adapter.dino_vit_adapter import ViTAdapter
+
+_RESNET_MEAN = [0.485, 0.456, 0.406]
+_RESNET_STD = [0.229, 0.224, 0.225]
 
 
 class Backbone(nn.Module):
     def __init__(self, args):
         super().__init__()
 
-        self.embedding_dim = args.transformer_embedding_dim 
-        encoder_dim = 384
+        self.D = args.D 
         self.size = args.input_size
-        self.stride = args.stride
+        self.stride = 4
 
-        self.vit_encoder = ViTAdapter(add_vit_feature=False, 
-                                    use_extra_extractor=True)      # initially, False, True
-        self.token_projection = nn.Conv2d(encoder_dim, self.embedding_dim, kernel_size=1, stride=1, padding=0)
+        self.with_cp = args.grad_checkpoint
+        self.vit_upsample_factor = args.vit_upsample_factor
 
+        model_name = args.vit_backbone[:6]  # "dinov2" or "dinov3"
+        arch_type = args.vit_backbone[7:]   # "s", "b", or "s_plus"
 
-        # === Data Normalization ===
-        self.normalization = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        if model_name == "dinov3":
+            from model.vit_adapter.dinov3_adapter.dinov3_vit_adapter import ViTAdapter
+            self.vit_encoder = ViTAdapter(deform_num_heads=12 if arch_type == "b" else 6,
+                                          with_cp=self.with_cp,
+                                          vit_upsample_factor=self.vit_upsample_factor,
+                                          arch_type=arch_type)
+            
+        else:
+            from model.vit_adapter.dinov2_adapter.dinov2_vit_adapter import ViTAdapter
+            self.vit_encoder = ViTAdapter(deform_num_heads=12 if arch_type == "b" else 6,
+                                          with_cp=self.with_cp,
+                                          vit_upsample_factor=self.vit_upsample_factor,
+                                          arch_type=arch_type)
+        
+        self.adapter_dim = self.vit_encoder.embed_dim
+
+        # modulelist
+        self.projections = nn.ModuleList([
+            nn.Sequential(nn.Linear(self.adapter_dim, self.D)),
+            nn.Sequential(nn.Linear(self.adapter_dim, self.D)),
+            nn.Sequential(nn.Linear(self.adapter_dim, self.D)),
+            nn.Sequential(nn.Linear(self.adapter_dim, self.D))
+        ])
 
         # === Positional embedding ===
 
-        self.P = (self.size[0] // self.stride) * (self.size[1] // self.stride)
-        self.H_prime = self.size[0] // self.stride
-        self.W_prime = self.size[1] // self.stride
+        self.H = self.size[0]
+        self.W = self.size[1]
+        self.Hf = self.H // self.stride
+        self.Wf = self.W // self.stride
+        self.P = int(self.Hf * self.Wf)                     # Number of tokens
 
-        self.frame_pos_embedding = nn.Parameter(torch.zeros(1, self.embedding_dim, self.H_prime, self.W_prime))  # (1, D, H, W)
-        nn.init.trunc_normal_(self.frame_pos_embedding, std=0.02)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, self.D, self.Hf, self.Wf))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
 
+        # Register normalization constants as buffers
+        for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
+            self.register_buffer(
+                name,
+                torch.FloatTensor(value).view(1, 3, 1, 1),
+                persistent=False,
+            )
 
-    def get_query_tokens(self, features, queries):
-        # :args features: (B * T, C, H4, W4)
-        # :args queries: (B, N, 3) where 3 is (t, y, x)
+    def project_feat(self, feat, idx):
+        # :args feat: (B * T, self.adapter_dim, Hs, Ws)
+        # :args scale: 1, 2, 4, 8
+
+        BT, _, Hs, Ws = feat.shape
+
+        feat = feat.permute(0, 2, 3, 1).reshape(BT, -1, self.adapter_dim)                                  # (B * T, Hs * Ws, 384)
+        feat = self.projections[idx](feat)                                                    # (B * T, Hs * Ws, D)
+        feat = feat.permute(0, 2, 1).reshape(BT, self.D, Hs, Ws)                              # (B * T, D, Hs, Ws)
+        return feat
+
+        
+    def forward(self, video):
+        # :args video: (B, T, C, self.H, self.W) in range [0, 1]
+        # :args queries: (B, N, 3) where 3 is (t, x, y)
         #
-        # :return queries: (B, N, C)
+        # :return f4, f8, f16, f32: (B, T, P, D), (B, T, P // 4, D), (B, T, P // 16, D), (B, T, P // 64, D)
 
-        B, N, _ = queries.shape
-        C = features.shape[1]
-        device = features.device
+        B, T, _, H, W = video.shape
+        D = self.D
+        assert H == self.H and W == self.W, f"Input video size {H}x{W} does not match the expected size {self.H}x{self.W}"
 
-        assert C == self.embedding_dim, f"Token embedding dim: {C} expected: {self.embedding_dim}"
+        video_flat = video.view(B * T, 3, H, W) # * 2 - 1.0                           # to [-1, 1]
+        video_flat = (video_flat - self._resnet_mean) / self._resnet_std              # Normalize to [-1, 1] range
 
-        H4, W4 = features.shape[-2], features.shape[-1]
-        features = features.view(B, -1, C, H4, W4)              # (B, T, C, H4, W4)
+        # === Extract features ===
+        f4, f8, f16, f32 = self.vit_encoder(video_flat)               # (B * T, 384, H4, W4)
 
-        query_features = torch.zeros(B, N, C, device=device)    # (B, N, C)
-        query_points_reshaped = queries.view(-1, 3)             # (B * N, 3)
-        t, x, y = query_points_reshaped[:, 0].long(), query_points_reshaped[:, 1], query_points_reshaped[:, 2]       # (B * N)
+        pos4 = self.pos_embedding                                                                               # (1, D, H4, W4)
+        pos8 = F.interpolate(self.pos_embedding, scale_factor=0.5, mode='bilinear', align_corners=False)        # (1, D, H8, W8)
+        pos16 = F.interpolate(self.pos_embedding, scale_factor=0.25, mode='bilinear', align_corners=False)      # (1, D, H16, W16)
+        pos32 = F.interpolate(self.pos_embedding, scale_factor=0.125, mode='bilinear', align_corners=False)     # (1, D, H32, W32)
 
-        source_frame_f = features[torch.arange(B).repeat_interleave(N), t].view(-1, C, H4, W4)                       # (B * N, C, H4, W4)
-        x_grid = (x / self.size[1]) * 2 - 1
-        y_grid = (y / self.size[0]) * 2 - 1
-
-        # assert (x_grid >= -1).all() and (x_grid <= 1).all(), f"x_grid: {x_grid}"
-        # assert (y_grid >= -1).all() and (y_grid <= 1).all(), f"y_grid: {y_grid}"
-
-        grid = torch.stack([x_grid, y_grid], dim=-1).view(B * N, 1, 1, 2).to(device)
-        sampled = F.grid_sample(source_frame_f, grid, mode='bilinear', padding_mode='border', align_corners=False)
-        query_features.view(-1, C)[:] = sampled.reshape(-1, C)      # (B * N, C)
-        query_features = query_features.view(B, N, C)
-
-        return query_features
-    
-    def forward(self, video, queries):
-        # :args video: (B, T, C, H, W) in range [0, 255]
-        # :args queries: (B, N, 3) where 3 is (t, y, x)
-        #
-        # :return tokens: (B, T, P, C)
-        # :return q: (B, N, C)
-
-        B, T, C, H, W = video.shape
-        B, N, _ = queries.shape
-
-        # === Normalize & Resize the video ===
-        video_flat = video.view(B * T, C, H, W) / 255.0             # (B * T, C, H, W), to [0, 1]
-        video_flat = F.interpolate(video_flat, size=self.size, mode="bilinear", align_corners=False)
-        video_flat = self.normalization(video_flat)         # to [-1, 1]
+        f4 = self.project_feat(f4, idx=0) + pos4                                                 # (B * T, D, H4, W4)
+        f8 = self.project_feat(f8, idx=1) + pos8                                                 # (B * T, D, H8, W8)           
+        f16 = self.project_feat(f16, idx=2) + pos16                                              # (B * T, D, H16, W16)
+        f32 = self.project_feat(f32, idx=3) + pos32                                              # (B * T, D, H32, W32)
         # === === ===
 
-        f4, f8, _, _ = self.vit_encoder(video_flat)               # (B * T, 384, H4, W4)
-        if self.stride == 4:
-            f = f4
-        elif self.stride == 8:
-            f = f8
-
-        C = f.shape[1]
-
-        f = self.token_projection(f)                                          # (B * T, H4 * W4, C)
-        f = f + self.frame_pos_embedding                                      # (B * T, C, H4, W4)
-
-        q = self.get_query_tokens(f, queries)                                   # (B, N, C)
-
-        f = f.permute(0, 2, 3, 1)                           # (B * T, H4, W4, C)
-        tokens = f.view(B, T, self.P, self.embedding_dim)   # (B, T, P, C)
-
-        assert tokens.shape == (B, T, self.P, self.embedding_dim), f"Tokens shape: {tokens.shape}, expected: {(B, T, self.P, self.embedding_dim)}"
-        assert q.shape == (B, N, self.embedding_dim), f"Queries shape: {queries.shape}, expected: {(B, N, self.embedding_dim)}"
-
-        return tokens, q
-    
-    # Online query sampling
-    def sample_queries_online(self, video, queries):
-        # :args video: (B, T, C, H, W) in range [0, 255]
-        # :args queries: (B, N, 3) where 3 is (t, x, y)
-        # :args query_features: (B, N, C)
-        #
-        # :return query_features: (B, N, C)
+        # === Reshape & Permute ===
+        f4 = f4.permute(0, 2, 3, 1).view(B, T, self.P, D)                    # (B, T, P, D)
+        f8 = f8.permute(0, 2, 3, 1).view(B, T, self.P // 4, D)               # (B, T, P // 4, D)
+        f16 = f16.permute(0, 2, 3, 1).view(B, T, self.P // 16, D)            # (B, T, P // 16, D)
+        f32 = f32.permute(0, 2, 3, 1).view(B, T, self.P // 64, D)            # (B, T, P // 64, D)
         
+        return f4, f8, f16, f32
 
-        B, T, C, H, W = video.shape
-        B, N, _ = queries.shape
-        device = video.device
-
-
-        query_features = torch.zeros(B, N, self.embedding_dim, device=queries.device)    # (B, N, 3)
-        for t in range(T):
-            queries_of_this_time = queries[:, :, 0] == t                               # (B, N)
-            query_positions = queries[queries_of_this_time].view(B, -1, 3)[:, :, 1:]   # (B, N', 2)
-            N_prime = query_positions.shape[1]
-
-            # No queries sampled at this time
-            if N_prime == 0:
-                continue
-
-            x, y = query_positions[:, :, 0], query_positions[:, :, 1]   # (B, N')
-            x_grid = (x / self.size[1]) * 2 - 1
-            y_grid = (y / self.size[0]) * 2 - 1
-            grid = torch.stack([x_grid, y_grid], dim=-1).view(B * N_prime, 1, 1, 2).to(device)  # (B * N', 1, 1, 2)
-
-
-            video_frame = video[:, t] / 255.0          # (B, C, H, W), to [0, 1]
-            video_frame = F.interpolate(video_frame, size=self.size, mode="bilinear", align_corners=False)
-            video_frame = self.normalization(video_frame)         # to [-1, 1]
-
-
-            f4, f8, _, _ = self.vit_encoder(video_frame)               # (B, 384, H4, W4)
-            if self.stride == 4:
-                f = f4
-            elif self.stride == 8:
-                f = f8
-
-            H_prime, W_prime = f.shape[-2], f.shape[-1]
-            assert H_prime == self.H_prime and W_prime == self.W_prime, f"Frame shape: {(H_prime, W_prime)}, expected: {(self.H_prime, self.W_prime)}"
-
-            f = self.token_projection(f)                                                                    # (B, C, H4, W4)
-            f = f + self.frame_pos_embedding                                                                # (B, C, H4, W4)
-            C = f.shape[1]
-
-            f = f.unsqueeze(1).expand(-1, N_prime, -1, -1, -1).reshape(B * N_prime, C, H_prime, W_prime)                # (B * N', C, H4, W4)
-
-            sampled = F.grid_sample(f, grid, mode='bilinear', padding_mode='border', align_corners=False)   # (B * N', C, 1, 1)
-            query_features[queries_of_this_time] = sampled.view(B, N_prime, C)                              # (B, N', C)
-
-
-        return query_features
-    
-    def encode_frames_online(self, frames):
-        # :args frame: (B, C, H, W) in range [0, 255]
-        #
-        # :return f: (B, P, C)
-
-        frames = frames.clone() / 255.0                     # (B, C, H, W), to [0, 1]
-        frames = F.interpolate(frames, size=self.size, mode="bilinear", align_corners=False)
-        frames = self.normalization(frames)                 # to [-1, 1]
-
-        f4, f8, _, _ = self.vit_encoder(frames)             # (B, 384, H4, W4)
-        if self.stride == 4:
-            f = f4
-        elif self.stride == 8:
-            f = f8
-
-
-        f = self.token_projection(f)                                          # (B, C, H4, W4)
-        f = f + self.frame_pos_embedding                                      # (B, C, H4, W4)
-        C = f.shape[1]
-
-        f = f.permute(0, 2, 3, 1)                           # (B, H4, W4, C)
-        f = f.reshape(f.shape[0], -1, C)                       # (B, P, C)
-
-        return f
-    

@@ -3,7 +3,7 @@ import os
 import pickle
 
 from typing import Iterable, Mapping, Tuple, Union
-
+import wandb
 
 def compute_tapvid_metrics(
     query_points: np.ndarray,
@@ -149,8 +149,8 @@ class Evaluator():
         self.delta_16 = []
         self.cnt = 0
 
-    def get_results(self):
-        return {
+    def get_results(self, epoch, log_to_wandb=True):
+        results = {
             "delta_avg": sum(self.delta_avg) / len(self.delta_avg),
             "delta_1": sum(self.delta_1) / len(self.delta_1),
             "delta_2": sum(self.delta_2) / len(self.delta_2),
@@ -160,6 +160,28 @@ class Evaluator():
             "aj": sum(self.aj) / len(self.aj),
             "oa": sum(self.oa) / len(self.oa),
         }
+        if log_to_wandb:
+            wandb.log({"Evaluation/delta_avg": results["delta_avg"],
+                            "Evaluation/delta_1": results["delta_1"],
+                            "Evaluation/delta_2": results["delta_2"],
+                            "Evaluation/delta_4": results["delta_4"],
+                            "Evaluation/delta_8": results["delta_8"],
+                            "Evaluation/delta_16": results["delta_16"],
+                            "Evaluation/AJ": results["aj"],
+                            "Evaluation/OA": results["oa"],
+                            "epoch": epoch}, commit=True)
+
+        print(f"delta_avg: {results['delta_avg']:.2f}")
+        print(f"delta_1: {results['delta_1']:.2f}")
+        print(f"delta_2: {results['delta_2']:.2f}")
+        print(f"delta_4: {results['delta_4']:.2f}")
+        print(f"delta_8: {results['delta_8']:.2f}")
+        print(f"delta_16: {results['delta_16']:.2f}")
+        print(f"AJ: {results['aj']:.2f}")
+        print(f"OA: {results['oa']:.2f}")
+
+        return results
+        
 
     def update(self, out_metrics, verbose=False):
         aj = out_metrics['average_jaccard'][0] * 100

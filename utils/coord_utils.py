@@ -1,4 +1,32 @@
 import torch
+import torch.nn.functional as F
+
+import numpy as np
+import cv2
+
+
+def coords_to_indices(points, size, ps=4):
+    # :arg points: (B, T, N, 2)
+    # :arg H: int
+    # :arg W: int
+    # :arg ps: int, patch size
+    #
+    # :return indices: (B, T, N) in [0, H //ps * W // ps) range
+
+    H, W = size
+    P = (H // ps) * (W // ps)
+
+    in_border_mask = (points[:, :, :, 0] >= 0) & (points[:, :, :, 0] < W) & (points[:, :, :, 1] >= 0) & (points[:, :, :, 1] < H)    # (B, T, N)
+
+    scaled_points = torch.floor(points / ps).long()                             # (B, T, N, 2)
+    indices = scaled_points[:, :, :, 1] * (W // ps) + scaled_points[:, :, :, 0] # (B, T, N)
+    indices = indices * in_border_mask.long()                                  # (B, T, N)
+
+    assert torch.all(indices < P), f"{indices.max()} >= {P}"
+    assert torch.all(indices >= 0)
+
+    # Each index explained with the upper left coordinate of the patch
+    return indices
 
 
 def indices_to_coords(indices, size, ps):
@@ -31,41 +59,73 @@ def indices_to_coords(indices, size, ps):
     
     return coordinates
 
-def coords_to_indices(points, size, ps):
-    # :arg points: (B, T, N, 2)
-    # :arg H: int
-    # :arg W: int
-    # :arg ps: int, patch size
+def sample_grid_points(f, coords, L=7):
+    # :arg f: (B, C, H, W)
+    # :arg coords: (B, N, 2), in [-1, 1] range
     #
-    # :return indices: (B, T, N) in [0, H //ps * W // ps) range
+    # :return: (B, N, C, 2L + 1, 2L + 1)
 
-    H, W = size
-    P = (H // ps) * (W // ps)
+    B, C, H, W = f.shape
+    _, N, _    = coords.shape
+    device, dtype = f.device, f.dtype
 
-    in_border_mask = (points[:, :, :, 0] >= 0) & (points[:, :, :, 0] < W) & (points[:, :, :, 1] >= 0) & (points[:, :, :, 1] < H)    # (B, T, N)
+    if L != 0:
+        half = (L - 1) // 2
+        delta_x = torch.linspace(-half, half, L, device=device, dtype=dtype) * (2.0 / W)
+        delta_y = torch.linspace(-half, half, L, device=device, dtype=dtype) * (2.0 / H)
+        dy, dx = torch.meshgrid(delta_y, delta_x, indexing='ij')                 # (L, L)
+        offsets = torch.stack((dx, dy), dim=-1)                                  # (L, L, 2)
 
-    scaled_points = torch.floor(points / ps).long()                             # (B, T, N, 2)
-    indices = scaled_points[:, :, :, 1] * (W // ps) + scaled_points[:, :, :, 0] # (B, T, N)
-    indices = indices * in_border_mask.long()                                  # (B, T, N)
+        grid = coords[:, :, None, None, :] + offsets[None, None, ...]            # (B, N, L, L, 2)
 
-    assert torch.all(indices < P), f"{indices.max()} >= {P}"
-    assert torch.all(indices >= 0)
+        grid_flat = grid.view(B, N * L, L, 2)       # -> (B, N*L, L, 2)
+        # now call grid_sample on (B, C, H, W) & (B, N*L, L, 2)
+        sampled_flat = F.grid_sample(f, grid_flat, mode='bilinear',
+                                    padding_mode='border',
+                                    align_corners=False)
+        # sampled_flat: (B, C, N*L, L)
+        # reshape back to (B, N, C, L, L)
+        sampled = (sampled_flat
+                    .view(B, C, N, L, L)
+                    .permute(0, 2, 1, 3, 4)
+                    .contiguous())
+        
+    else:
+        # just sample the single point per track
+        # build a grid of shape (B, N, 1, 2)
+        # then grid_sample returns (B, C, N, 1)
+        grid = coords.view(B, N, 1, 2)
+        sampled_pt = F.grid_sample(
+            f, grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False
+        )  # → (B, C, N, 1)
+        # reorder to (B, N, C, 1, 1)
+        sampled = sampled_pt.permute(0, 2, 1, 3) \
+                            .unsqueeze(-1) \
+                            .contiguous()
 
-    # Each index explained with the upper left coordinate of the patch
-    return indices
+    return sampled
 
 
-def get_queries(traj, vis):
+def get_queries(traj, vis, N_rand=None):
     # traj: (B, T, N, 2)
     # vis: (B, T, N)
     #
     # returns: (B, N, 3) where 3 is (frame_ind, x, y)
 
+    # just before calling get_queries
+    assert traj.size(2) > 0, "N==0 just entered the model"          # (1)
+    assert (vis.sum(dim=1) != 0).all(), "Found a track that is never visible in any frame"
+
     B, T, N, D = traj.shape
     device = traj.device
 
     __, first_positive_inds = torch.max(vis, dim=1) # (B, N)
-    N_rand = N // 4
+    
+    if N_rand is None:
+        N_rand = N // 4
     # inds of visible points in the 1st frame
     nonzero_inds = [[torch.nonzero(vis[b, :, i]) for i in range(N)] for b in range(B)]
 
@@ -117,4 +177,5 @@ def get_points_on_a_grid(size, extent, device):
         indexing="ij",
     )
     return torch.stack([grid_x, grid_y], dim=-1).reshape(1, -1, 2)
+
 

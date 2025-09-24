@@ -1,3 +1,4 @@
+# ==== Below is based on https://github.com/facebookresearch/co-tracker/blob/main/cotracker/datasets/tap_vid_datasets.py ====
 import os
 import io
 from glob import glob
@@ -9,7 +10,6 @@ import mediapy as media
 from PIL import Image
 from typing import Mapping, Tuple, Union
 
-# These classes are adapted from https://github.com/facebookresearch/co-tracker/blob/main/cotracker/datasets/kubric_movif_dataset.py
 
 DatasetElement = Mapping[str, Mapping[str, Union[np.ndarray, str]]]
 
@@ -84,10 +84,17 @@ def sample_queries_strided(
 
 
 class TAPVid(torch.utils.data.Dataset):
-    def __init__(self, args):
+    def __init__(self, args, data_root=None, dataset_type=None):
 
-        data_root = args.tapvid_root
-        self.dataset_type = args.eval_dataset
+        if data_root is None:
+            data_root = args.tapvid_root
+        else:
+            self.data_root = data_root
+
+        if dataset_type is None:
+            self.dataset_type = args.eval_dataset
+        else:
+            self.dataset_type = dataset_type
         
         self.resize_to_256 = True
         self.queried_first = True
@@ -147,8 +154,10 @@ class TAPVid(torch.utils.data.Dataset):
         target_points = self.points_dataset[video_name]["points"].copy()
         if self.resize_to_256:
             frames = resize_video(frames, [256, 256])
+            # target_points *= np.array([255, 255])  # 1 should be mapped to 256-1
             target_points *= np.array([256, 256])  # 1 should be mapped to 256
         else:
+            # target_points *= np.array([frames.shape[2] - 1, frames.shape[1] - 1])
             target_points *= np.array([frames.shape[2], frames.shape[1]])
 
         target_occ = self.points_dataset[video_name]["occluded"].copy()
@@ -169,3 +178,4 @@ class TAPVid(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.points_dataset)
+    

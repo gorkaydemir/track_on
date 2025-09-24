@@ -9,24 +9,77 @@ import torchvision.transforms as T
 from utils.coord_utils import coords_to_indices, indices_to_coords
 
 class Loss_Function(nn.Module):
-    def __init__(self, args, tmp=0.05):
+    def __init__(self, args):
         super().__init__()
 
-        self.gamma = 1.0
-
         self.size = args.input_size
-        self.stride = args.stride
-
-        self.lambda_point = args.lambda_point
-        self.lambda_vis = args.lambda_vis
-        self.lambda_offset = args.lambda_offset
-        self.lambda_uncertainty = args.lambda_uncertainty
-        self.lambda_top_k = args.lambda_top_k
-
-        self.loss_after_query = args.loss_after_query
+        self.stride = 4
+        self.epsilon_smoothing = 0.0
+        self.lambda_patch_cls = args.lambda_patch_cls
+        self.temperature = 0.05
 
 
-        self.temperature = tmp
+    def forward(self, out, gt_tracks, gt_visibility, query_times):
+        # :args out: dict
+        #        C1: (B, T, N, P)
+        #        P: (B, T, N, 2)
+        #        V_logit: (B, T, N)
+        #        U_logit: (B, T, N)
+        #        O: (B, T, #layers, N, 2)
+        #        P_patch: (B, T, N, 2)
+        #        U_logit_top_k: (B, T, N, K)
+        #        S_logit_top_k: (B, T, N, K)
+        #        P_patch_top_k: (B, T, N, K, 2)
+        #
+        # :args gt_tracks: (B, T, N, 2)
+        # :args gt_visibility: (B, T, N)
+        # :args query_times: (B, N)
+
+
+        # :return loss:
+
+        B, T, N, _ = gt_tracks.shape
+        C1 = out["C1"]                                          # (B, T, N, P)
+        C2 = out["C2"]                                          # (B, T, N, P)
+        O = out["O"]                                            # (B, T, #layers, N, 2)
+        V = out["V_logit"]                                   # (B, T, #layers, N)
+        U = out["U_logit"]                                   # (B, T, #layers, N)
+        P_patch = out["P_patch"]                             # (B, T, N, 2)
+
+        layer_num_pred_head = O.shape[2]                    # Number of layers in prediction head
+
+        # Top-K related
+        U_top_k = out["U_logit_top_k"]                       # (B, T, N, K)
+        S_top_k = out["S_logit_top_k"]                       # (B, T, N, K)
+        P_patch_top_k = out["P_patch_top_k"]                 # (B, T, N, K, 2)
+        K = P_patch_top_k.shape[-2]                        # Top-K
+
+        # === Point Loss ===
+        L_p = self.patch_classification_loss(C1, gt_tracks, gt_visibility, query_times)        # (B * T * N)
+        L_p2 = self.patch_classification_loss(C2, gt_tracks, gt_visibility, query_times)       # (B * T * N)
+
+        # == Offset Loss ===
+        L_o = 0
+        for i in range(layer_num_pred_head):
+            L_o += self.offset_loss(O[:, :, i], P_patch, gt_tracks, gt_visibility, query_times)
+        L_o /= layer_num_pred_head
+                               
+        # === Visibility Loss ===
+        L_vis = self.visibility_loss(V, gt_visibility, query_times)
+
+        # === Uncertainty Loss ===
+        L_u = self.uncertainty_loss(U, P_patch, gt_tracks, gt_visibility, query_times)
+
+        # === Top-K Uncertainty ===
+        L_topk_u = 0
+        for k in range(K):
+            L_topk_u += self.uncertainty_loss(U_top_k[:, :, :, k], P_patch_top_k[:, :, :, k], gt_tracks, gt_visibility, query_times)
+        L_topk_u /= K
+
+        L_topk_rank = self.region_rank_loss(S_top_k, P_patch_top_k, gt_tracks, gt_visibility, query_times)
+
+        return L_p, L_p2, L_vis, L_o, L_u, L_topk_u, L_topk_rank
+
 
     def get_gt_offset(self, gt_tracks, stride, p_t):
 
@@ -49,24 +102,21 @@ class Loss_Function(nn.Module):
 
         # === Masks ===
         # visibility mask
-        vis_mask = gt_visibility.float().view(-1)                                         # (B * T * N)
+        vis_mask = gt_visibility.float().reshape(-1)                                         # (B * T * N)
 
         # time mask
-        if self.loss_after_query:
-            time_indices = torch.arange(T).reshape(1, T, 1).to(device)                      # (1, T, 1)
-            query_times_expanded = query_times.unsqueeze(1)                                 # (B, 1, N)
-            time_mask = (time_indices > query_times_expanded).float()                      # (B, T, N)
-            time_mask = time_mask.view(B * T * N)                                           # (B * T * N)
-        else:
-            time_mask = torch.ones(B * T * N, device=device).float()
-        
+        time_indices = torch.arange(T).reshape(1, T, 1).to(device)                      # (1, T, 1)
+        query_times_expanded = query_times.unsqueeze(1)                                 # (B, 1, N)
+        time_mask = (time_indices > query_times_expanded).float()                      # (B, T, N)
+        time_mask = time_mask.view(B * T * N)                                           # (B * T * N)
+
         mask_point = vis_mask * time_mask                                              # (B * T * N)
         mask_visible = time_mask
 
         return mask_point, mask_visible
 
 
-    def point_loss(self, p_t, gt_tracks, gt_visibility, query_times):
+    def patch_classification_loss(self, p_t, gt_tracks, gt_visibility, query_times):
         # :args P_t: (B, T, N, P_prime)
         # :args gt_tracks: (B, T, N, 2)
         # :args gt_visibility: (B, T, N)
@@ -81,11 +131,12 @@ class Loss_Function(nn.Module):
         gt_indices = coords_to_indices(gt_tracks, self.size, self.stride).view(-1)         # (B * T * N)
 
         p_t = p_t.reshape(B * T * N, -1)                                                           # (B * T * N, P)
-        L_p = F.cross_entropy(p_t / self.temperature, gt_indices.long(), reduction="none")  # (B * T * N)
+        L_p = F.cross_entropy(p_t / self.temperature, gt_indices.long(), reduction="none", 
+                              label_smoothing=self.epsilon_smoothing)                # (B * T * N)
         L_p = L_p * mask_point                                                       # (B * T * N)
         L_p = L_p.sum() / mask_point.sum()
 
-        L_p *= self.lambda_point
+        L_p *= self.lambda_patch_cls
 
         return L_p
     
@@ -101,18 +152,16 @@ class Loss_Function(nn.Module):
 
         _, mask_visible = self.get_masks(gt_visibility, query_times)
 
-        L_vis = F.binary_cross_entropy_with_logits(V_t, gt_visibility.float(), reduction="none")    # (B, T, N)
-        L_vis = L_vis.view(B * T * N)                                                   # (B * T * N)
+        L_vis = F.binary_cross_entropy_with_logits(V_t.float(), gt_visibility.float(), reduction="none")    # (B, T, N)
+        L_vis = L_vis.reshape(B * T * N)                                                   # (B * T * N)
         L_vis = L_vis * mask_visible                                                   # (B * T * N)
         L_vis = L_vis.sum() / mask_visible.sum()
-
-        L_vis *= self.lambda_vis
 
         return L_vis
     
 
     def offset_loss(self, O_t, ref_point, gt_tracks, gt_visibility, query_times, coordinate_pt=False):
-        # :args O_t: (B, T, #offset_layers, N, 2)
+        # :args O_t: (B, T, N, 2)
         # :args P_t: (B, T, N, 2)
         # :args gt_tracks: (B, T, N, 2)
         # :args gt_visibility: (B, T, N)
@@ -124,29 +173,13 @@ class Loss_Function(nn.Module):
 
         mask_point, _ = self.get_masks(gt_visibility, query_times)
 
-        offset_layer_num = O_t.size(2)
-
         gt_offset = gt_tracks - ref_point
 
-        cnt_offset = 0
-        L_offset = 0
-        for l in range(offset_layer_num):
-
-            o_l = O_t[:, :, l]                                          # (B, T, N, 2)
-            offset_loss = F.l1_loss(o_l, gt_offset, reduction="none")   # (B, T, N, 2)
-            offset_loss = offset_loss.sum(dim=-1).view(-1)                          # (B * T * N)
-            offset_loss = offset_loss * mask_point                                  # (B * T * N)
-
-            offset_loss = torch.clamp(offset_loss, min=0, max=2 * self.stride)
-
-            offset_loss = offset_loss.sum() / mask_point.sum()
-            offset_loss *= (self.gamma ** (offset_layer_num - l - 1))
-            cnt_offset += 1
-
-            L_offset += offset_loss
-
-        L_offset *= self.lambda_offset
-        L_offset /= cnt_offset
+        L_offset = F.l1_loss(O_t, gt_offset, reduction="none")   # (B, T, N, 2)
+        L_offset = L_offset.sum(dim=-1).view(-1)                          # (B * T * N)
+        L_offset = L_offset * mask_point                                  # (B * T * N)
+        L_offset = torch.clamp(L_offset, min=0, max=2 * self.stride)
+        L_offset = L_offset.sum() / mask_point.sum()
 
         return L_offset
 
@@ -157,23 +190,51 @@ class Loss_Function(nn.Module):
         # :args gt_tracks: (B, T, N, 2)
         # :args gt_visibility: (B, T, N)
         # :args query_times: (B, N)
-
+        
         B, T, N, _ = gt_tracks.shape
 
-        _, mask_visible = self.get_masks(gt_visibility, query_times)                 # (B * T * N)
+        _, loss_mask = self.get_masks(gt_visibility, query_times)   # all points after query times
+        delta = 12
 
         # L2 difference between point_pred and gt_tracks
         uncertainty_loss = F.mse_loss(point_pred, gt_tracks, reduction="none")        # (B, T, N, 2)
         uncertainty_loss = uncertainty_loss.sum(dim=-1).sqrt()                        # (B, T, N)
 
         # (uncertainty_loss > 8.0) or (~gt_visibility)
-        uncertains = (uncertainty_loss > 8.0) | (~gt_visibility)      # (B, T, N)
+        uncertains = (uncertainty_loss > delta) | (~gt_visibility)     # (B, T, N)
 
-        # uncertains = (uncertainty_loss < 8.0).float() * (~gt_visibility).float()      # (B, T, N)
-
-        L_unc = F.binary_cross_entropy_with_logits(U_t, uncertains.float(), reduction="none")        # (B, T, N)
-        L_unc = L_unc.view(B * T * N)                                                   # (B * T * N)
-        L_unc = L_unc * mask_visible                                                   # (B * T * N)
-        L_unc = L_unc.sum() / mask_visible.sum()
+        L_unc = F.binary_cross_entropy_with_logits(U_t.float(), 
+                                                   uncertains.float(), 
+                                                   reduction="none")     # (B, T, N)
+        L_unc = L_unc.view(B * T * N)                                               # (B * T * N)
+        L_unc = L_unc * loss_mask                                                   # (B * T * N)
+        L_unc = L_unc.sum() / loss_mask.sum()
 
         return L_unc
+    
+    
+    def region_rank_loss(self, S_top_k, P_patch_top_k, gt_tracks, gt_visibility, query_times):
+        # :args S_top_k: (B, T, N, K)
+        # :args P_patch_top_k: (B, T, N, K, 2)
+        # :args gt_tracks: (B, T, N, 2)
+        # :args gt_visibility: (B, T, N)
+        # :args query_times: (B, N)
+
+        B, T, N = gt_visibility.shape
+        K = S_top_k.shape[-1]
+
+        mask_point, _ = self.get_masks(gt_visibility, query_times)                 # (B * T * N)
+
+        gt_expanded = gt_tracks.unsqueeze(-2).expand(-1, -1, -1, K, -1)  # (B, T, N, K, 2)
+    
+        distances = torch.norm(P_patch_top_k - gt_expanded, dim=-1)      # (B, T, N, K)        
+        best_indices = distances.argmin(dim=-1)  # (B, T, N)
+
+        # apply cross entropy loss
+        best_indices = best_indices.view(B * T * N)
+        S_top_k = S_top_k.reshape(B * T * N, K)
+
+        L_rank = F.cross_entropy(S_top_k.float(), best_indices.long(), reduction="none")  # (B * T * N)
+        L_rank = L_rank * mask_point
+        L_rank = L_rank.sum() / mask_point.sum()
+        return L_rank

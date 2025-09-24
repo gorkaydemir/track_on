@@ -1,0 +1,32 @@
+eval_dataset: "davis"
+
+frame_sampling: "uniform"
+frame_sample_ratio: 2.0
+
+input_size: [384, 512]
+N: 384
+T: 48
+
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+
+vit_backbone: "dinov3_s_plus"
+vit_upsample_factor: 1.143
+
+M_i: 72
+delta_v: 0.8
+
+lambda_patch_cls: 3.0
+
+evaluation: False
+epoch_num: 200
+lr: 0.0005 # 5e-4
+wd: 0.00001   # 1e-5
+bs: 1
+grad_checkpoint: True
+amp: True
+seed: 1234
