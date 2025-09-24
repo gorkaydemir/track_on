@@ -1,6 +1,6 @@
 # Track-On2: Enhancing Online Point Tracking with Memory
 
-## [**Webpage**](https://kuis-ai.github.io/track_on2) | [**Track-On (ICLR’25)**](https://arxiv.org/abs/2501.18487) | **[**Track-On2**](https://arxiv.org/abs/2509.19115)**
+## [**Webpage**](https://kuis-ai.github.io/track_on2) | [**Track-On**](https://arxiv.org/abs/2501.18487) | **[**Track-On2**](https://arxiv.org/abs/2509.19115)**
 
 This repository contains the official implementation of both versions:  
 > **Track-On: Transformer-based Online Point Tracking with Memory**  
@@ -86,7 +86,7 @@ traj, vis = model(video, queries)
 
 # Outputs
 # traj: (1, T, N, 2)  -> per-point (x, y) in pixels
-# vis:  (1, T, N)     -> per-point visibility probability in [0, 1]
+# vis:  (1, T, N)     -> per-point visibility in {0, 1}
 ```
 
 ### Using `demo.py`
