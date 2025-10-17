@@ -211,7 +211,7 @@ class InteractionBlockWithCls(nn.Module):
                 x = cp.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
-            x = x[0]
+            # x = x[0]
 
         cls_token, x = x[:, :1], x[:, 1:]       # [b, 1, c], [b, n, c]
         c = self.extractor(query=c, reference_points=deform_inputs2[0],
