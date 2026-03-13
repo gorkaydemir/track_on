@@ -1,37 +1,21 @@
 import torch
 from model.trackon import Track_On2
 import torch.nn.functional as F
-from evaluation.evaluator import get_points_on_a_grid  # adjust import if needed
-from collections import OrderedDict
-
-ALLOWED_MISSING_PREFIXES = (
-    "backbone.vit_encoder.dinov2",
-    "backbone.vit_encoder.dinov3",
-)
-
-def _strip_module_prefix(state_dict: dict) -> OrderedDict:
-    if not any(k.startswith("module.") for k in state_dict.keys()):
-        return state_dict
-    return OrderedDict((k[len("module."):], v) if k.startswith("module.") else (k, v)
-                       for k, v in state_dict.items())
-
-def _extract_state_dict(obj) -> dict:
-    if isinstance(obj, dict):
-        for key in ("state_dict", "model", "model_state", "ema_state_dict"):
-            if key in obj and isinstance(obj[key], dict):
-                return obj[key]
-        return obj
-    return obj
+from utils.coord_utils import get_points_on_a_grid
+from utils.train_utils import load_pretrained_weights
 
 
 class Predictor(torch.nn.Module):
-    def __init__(self, model_args, checkpoint_path=None, support_grid_size=20):
+    def __init__(self, model_args=None, checkpoint_path=None, support_grid_size=20):
         super().__init__()
+
+        if model_args is None:
+            model_args = self._default_args()
+
         self.model = Track_On2(model_args)
 
-
         if checkpoint_path is not None:
-            self._load_model_and_check(checkpoint_path)
+            load_pretrained_weights(self.model, checkpoint_path)
 
         # Optional inference-time memory extension
         ime_size = getattr(model_args, "M_i", 72)
@@ -45,32 +29,24 @@ class Predictor(torch.nn.Module):
 
         self.reset()
 
-    def _load_model_and_check(self, checkpoint_path):
-        raw = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = _strip_module_prefix(_extract_state_dict(raw))
+    def _default_args(self):
+        class Args:
+            def __init__(self):
+                self.input_size = [384, 512]
+                self.M = 24
+                self.D = 256
+                self.K = 16
+                self.decoder_layer_num = 3
+                self.predicton_head_layer_num = 3
+                self.rerank_layer_num = 3
+                self.vit_backbone = "dinov3_s_plus"
+                self.vit_upsample_factor = 1.143
+                self.grad_checkpoint = True
 
-        # Try load with strict=False, then validate missing keys
-        load_result = self.model.load_state_dict(state_dict, strict=False)
-        missing = list(load_result.missing_keys)
-        unexpected = list(load_result.unexpected_keys)
+                self.M_i = 72       # Inference-time memory size (should be larger than training M for better performance)
+                self.delta_v = 0.8  # Visibility threshold for inference
 
-        if unexpected:
-            raise RuntimeError(f"Unexpected keys in checkpoint (not present in model): {unexpected}")
-
-        disallowed_missing = [
-            k for k in missing
-            if not any(k.startswith(pfx) for pfx in ALLOWED_MISSING_PREFIXES)
-        ]
-
-        if disallowed_missing:
-            raise RuntimeError(
-                "Checkpoint is missing parameters outside the allowed encoders.\n"
-                f"Disallowed missing keys:\n  {disallowed_missing}\n"
-                f"(Allowed missing prefixes: {ALLOWED_MISSING_PREFIXES})")
-
-        print(f"Loaded model weights from {checkpoint_path}")
-        if missing:
-            print(f"Info: missing (allowed) weights: {len(missing)} keys under {set(p.split('.')[0] + '.' + p.split('.')[1] + '.' + p.split('.')[2] for p in missing)}")
+        return Args()
 
     def reset(self):
         """Reset all tracking state to start fresh."""

@@ -5,6 +5,8 @@ import os
 import sys
 import random
 
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -15,6 +17,9 @@ from argparse import Namespace
 
 from dataset.movi_f import Movi_F_Large
 from dataset.tapvid import TAPVid
+from dataset.real_world_dataset import Real_World_Dataset
+from dataset.epic_k import EpicK
+from dataset.syn_real_dataset import SynRealDataset
 from datetime import timedelta
 
 
@@ -27,13 +32,33 @@ def load_args_from_yaml(yaml_path: str):
     args = Namespace(**cfg)
     return args
 
-def get_dataloaders(args):
+def get_dataloaders(args, train_set="kubric"):
     def seed_worker(worker_id):
         worker_seed = torch.initial_seed() % 2**32
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
-    train_dataset = Movi_F_Large(args)
+    if train_set == "kubric":
+        train_dataset = Movi_F_Large(args)
+    elif train_set == "epic_k":
+        train_dataset = EpicK(args.epic_k_path, T=24, N=args.N, enable_aug=True)
+    elif train_set == "real":
+        real_dataset = Real_World_Dataset(args.rw_dataset_path,
+                                          T=args.T,
+                                          N=args.N,
+                                          use_ovis=args.use_ovis,
+                                          use_vspw=args.use_vspw,
+                                          frame_rate=args.frame_sample_ratio)
+        if getattr(args, "syn_real_training", False):
+            syn_dataset   = Movi_F_Large(args)
+            train_dataset = SynRealDataset(real_dataset, syn_dataset)
+            print(f"SynReal training: {len(real_dataset)} real + {len(syn_dataset)} synthetic = {len(train_dataset)} total samples")
+        else:
+            # Wrap in SynRealDataset (real-only) so the training loop always
+            # receives the unified 6-tuple format.
+            train_dataset = SynRealDataset(real_dataset, syn_dataset=None)
+            print(f"Real-only training: {len(real_dataset)} samples")
+
     val_dataset = TAPVid(args)
 
     # (#cpus * #gpus) in a node:
@@ -69,11 +94,11 @@ def get_dataloaders(args):
     return train_dataloader, val_dataloader
 
 
-def get_scheduler(args, optimizer, train_loader, constant=False):
+def get_scheduler(args, optimizer, train_loader, constant=False, warmup=False):
     if constant:
         scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=args.epoch_num)
 
-    else:
+    elif warmup:
         T_max = (len(train_loader)) * args.epoch_num
         warmup_steps = int(T_max * 0.01)
         steps = T_max - warmup_steps
@@ -81,6 +106,9 @@ def get_scheduler(args, optimizer, train_loader, constant=False):
         linear_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-5, total_iters=warmup_steps)
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[linear_scheduler, cosine_scheduler], milestones=[warmup_steps])
+    else:
+        T_max = (len(train_loader)) * args.epoch_num
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max)
 
     return scheduler
 
@@ -117,6 +145,56 @@ def restart_from_checkpoint(remove_module, checkpoint_path, run_variables, **kwa
             if var_name in checkpoint:
                 run_variables[var_name] = checkpoint[var_name]
                 
+
+# === Loading pretrained Track-On2 checkpoint ===
+
+ALLOWED_MISSING_PREFIXES = (
+    "backbone.vit_encoder.dinov2",
+    "backbone.vit_encoder.dinov3",
+)
+
+def _strip_module_prefix(state_dict: dict) -> OrderedDict:
+    if not any(k.startswith("module.") for k in state_dict.keys()):
+        return state_dict
+    return OrderedDict((k[len("module."):], v) if k.startswith("module.") else (k, v)
+                       for k, v in state_dict.items())
+
+def _extract_state_dict(obj) -> dict:
+    if isinstance(obj, dict):
+        for key in ("state_dict", "model", "model_state", "ema_state_dict"):
+            if key in obj and isinstance(obj[key], dict):
+                return obj[key]
+        return obj
+    return obj
+
+def load_pretrained_weights(model, checkpoint_path):
+    raw = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _strip_module_prefix(_extract_state_dict(raw))
+
+    # Try load with strict=False, then validate missing keys
+    load_result = model.load_state_dict(state_dict, strict=False)
+    missing = list(load_result.missing_keys)
+    unexpected = list(load_result.unexpected_keys)
+
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in checkpoint (not present in model): {unexpected}")
+
+    disallowed_missing = [
+        k for k in missing
+        if not any(k.startswith(pfx) for pfx in ALLOWED_MISSING_PREFIXES)
+    ]
+
+    if disallowed_missing:
+        raise RuntimeError(
+            "Checkpoint is missing parameters outside the allowed encoders.\n"
+            f"Disallowed missing keys:\n  {disallowed_missing}\n"
+            f"(Allowed missing prefixes: {ALLOWED_MISSING_PREFIXES})")
+
+    print(f"Loaded model weights from {checkpoint_path}")
+    if missing:
+        print(f"Info: missing (allowed) weights: {len(missing)} keys under {set(p.split('.')[0] + '.' + p.split('.')[1] + '.' + p.split('.')[2] for p in missing)}")
+
+
 
 # ===  Distributed Settings ===
 def is_dist_avail_and_initialized():

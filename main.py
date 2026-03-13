@@ -298,19 +298,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Training for Track-On2")
 
     parser.add_argument("--config_path", type=str, required=True, help='Path to the config file')
-    parser.add_argument("--movi_f_root", type=str, help='Path to the MOVi-F dataset')
-    parser.add_argument("--tapvid_root", type=str, help='Path to the TAP-Vid DAVIS dataset')
-    parser.add_argument("--model_save_path", type=str, help='Path to save the model checkpoints')
-    parser.add_argument("--checkpoint_path", type=str, default=None, help='Path to the model checkpoint to resume training')
     args_cmd = parser.parse_args()
 
     args = load_args_from_yaml(args_cmd.config_path)
     
-    args.movi_f_root = args_cmd.movi_f_root
-    args.tapvid_root = args_cmd.tapvid_root
-    args.model_save_path = args_cmd.model_save_path
-    args.checkpoint_path = args_cmd.checkpoint_path
-
     args.gpus = torch.cuda.device_count()
     Path(args.model_save_path).mkdir(parents=True, exist_ok=True)
 

@@ -11,66 +11,107 @@ from tqdm import tqdm
 import cv2
 import imageio.v2 as imageio
 
-import argparse
-from utils.coord_utils import get_points_on_a_grid
-from utils.eval_utils import Evaluator, compute_tapvid_metrics
 
-EPS = 1e-6
-
-def reduce_masked_mean(input, mask, dim=None, keepdim=False):
-    mask = mask.expand_as(input)
-
-    prod = input * mask
-
-    if dim is None:
-        numer = torch.sum(prod)
-        denom = torch.sum(mask)
-    else:
-        numer = torch.sum(prod, dim=dim, keepdim=keepdim)
-        denom = torch.sum(mask, dim=dim, keepdim=keepdim)
-
-    mean = numer / (EPS + denom)
-    return mean
+from utils.eval_utils import DREvaluator, POEvaluator, EgoPointsEvaluator, TAPVidEvaluator
+from utils.eval_utils import compute_tapvid_metrics, compute_dr_metrics, compute_po_metrics, compute_ego_points_metrics
 
 
-def reduce_masked_median(x, mask, keep_batch=False):
-    # x and mask are the same shape
-    assert(x.size() == mask.size())
-    device = x.device
+def compute_oracle_prediction(ensemble_tracks_list, ensemble_visibility_list, gt_trajectory, gt_visibility):
+    """Compute oracle prediction by selecting, for each track and time step, the
+    ensemble member with the lowest L2 error to the ground truth.  This gives
+    the upper bound on what any selection strategy could achieve.
 
-    B = list(x.shape)[0]
-    x = x.detach().cpu().numpy()
-    mask = mask.detach().cpu().numpy()
+    Args:
+        ensemble_tracks_list: list of M CPU tensors, each (B, T, N, 2)
+        ensemble_visibility_list: list of M CPU tensors, each (B, T, N)
+        gt_trajectory: (B, T, N, 2) ground truth positions (on any device)
+        gt_visibility: (B, T, N) ground truth visibility (1 = visible)
 
-    if keep_batch:
-        x = np.reshape(x, [B, -1])
-        mask = np.reshape(mask, [B, -1])
-        meds = np.zeros([B], np.float32)
-        for b in list(range(B)):
-            xb = x[b]
-            mb = mask[b]
-            if np.sum(mb) > 0:
-                xb = xb[mb > 0]
-                meds[b] = np.median(xb)
-            else:
-                meds[b] = np.nan
-        meds = torch.from_numpy(meds).to(device)
-        return meds.float()
-    else:
-        x = np.reshape(x, [-1])
-        mask = np.reshape(mask, [-1])
-        if np.sum(mask) > 0:
-            x = x[mask > 0]
-            med = np.median(x)
-        else:
-            med = np.nan
-        med = np.array([med], np.float32)
-        med = torch.from_numpy(med).to(device)
-        return med.float()
+    Returns:
+        oracle_tracks: (B, T, N, 2) CPU tensor
+        oracle_visibility: (B, T, N) CPU tensor – uses GT visibility
+    """
+    ensemble_tracks = torch.stack(ensemble_tracks_list, dim=-2).cpu().float()  # (B, T, N, M, 2)
+    gt_traj_cpu = gt_trajectory.cpu().float()  # (B, T, N, 2)
+
+    # L2 distance to GT for every model at every (b, t, n)
+    gt_exp = gt_traj_cpu.unsqueeze(-2)                              # (B, T, N, 1, 2)
+    errors = torch.norm(ensemble_tracks - gt_exp, dim=-1)          # (B, T, N, M)
+
+    # Index of best model per (b, t, n)
+    best_idx = torch.argmin(errors, dim=-1)                        # (B, T, N)
+
+    # Gather oracle tracks
+    best_idx_exp = best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, 2)  # (B, T, N, 1, 2)
+    oracle_tracks = torch.gather(ensemble_tracks, dim=-2, index=best_idx_exp).squeeze(-2)  # (B, T, N, 2)
+
+    # Oracle visibility = GT visibility (perfect knowledge)
+    oracle_visibility = gt_visibility.cpu().clone().float()
+    return oracle_tracks, oracle_visibility
+
+
+def prepare_tapvid_data(trajectory, visibility, query_points_i, device):
+    """Prepare TAP-Vid data for model inference
     
+    Args:
+        video: (B, T, 3, H, W)
+        trajectory: (B, T, N, 2)
+        visibility: (B, T, N)
+        query_points_i: (B, N, 3) in format (t, y, x)
+        device: torch device
+        
+    Returns:
+        queries: (B, N, 3) in format (t, x, y)
+        gt_tracks: numpy array for evaluation
+        gt_occluded: numpy array for evaluation
+        query_points: numpy array for evaluation
+    """
+    # Change (t, y, x) to (t, x, y)
+    queries = query_points_i.clone().float()
+    queries = torch.stack([queries[:, :, 0], queries[:, :, 2], queries[:, :, 1]], dim=2).to(device)
+    
+    # Prepare ground truth for evaluation (From CoTracker format)
+    traj = trajectory.clone()
+    query_points = query_points_i.clone().cpu().numpy()
+    gt_tracks = traj.permute(0, 2, 1, 3).cpu().numpy()
+    gt_occluded = torch.logical_not(visibility.clone().permute(0, 2, 1)).cpu().numpy()
+    
+    return queries, gt_tracks, gt_occluded, query_points
+
+
 @torch.no_grad()
-def evaluate_tapvid(model, dataloader, delta_v, print_each=True):
-    evaluator = Evaluator()
+def evaluate_tapvid(models, dataloader, print_each=True, cache_predictions=False, cache_dir=None, dataset_name=None):
+    """Evaluate multiple models on TAP-Vid dataset
+    
+    Args:
+        models: dict mapping model_name -> model or single model
+        dataloader: TAP-Vid dataloader
+        print_each: whether to print per-sample metrics
+    """
+    # Handle single model or dict of models
+    if not isinstance(models, dict):
+        models = {'model': models}
+    
+    # Check if verifier / oracle / random are in the models
+    has_verifier = 'verifier' in models
+    if has_verifier:
+        verifier = models.pop('verifier')  # Remove verifier, will run it last
+    has_oracle = 'oracle' in models
+    if has_oracle:
+        models.pop('oracle')  # Oracle has no model; computed from other predictions
+    has_random = 'random' in models
+    if has_random:
+        models.pop('random')  # Random has no model; computed from other predictions
+
+    model_names = list(models.keys())
+    if has_verifier:
+        model_names.append('verifier')  # Add verifier to evaluated models
+    if has_oracle:
+        model_names.append('oracle')  # Oracle upper bound
+    if has_random:
+        model_names.append('random')  # Round-robin random baseline
+
+    evaluator = TAPVidEvaluator(model_names)
 
     for j, (video, trajectory, visibility, query_points_i) in enumerate(dataloader):
         query_points_i = query_points_i.cuda(non_blocking=True)      # (1, N, 3)
@@ -81,32 +122,151 @@ def evaluate_tapvid(model, dataloader, delta_v, print_each=True):
         _, _, _, H, W = video.shape
         device = video.device
 
-        # Change (t, y, x) to (t, x, y)
-        queries = query_points_i.clone().float()
-        queries = torch.stack([queries[:, :, 0], queries[:, :, 2], queries[:, :, 1]], dim=2).to(device)       # (1, N, 3)
+        # Prepare data for all models
+        queries, gt_tracks, gt_occluded, query_points = prepare_tapvid_data(
+            trajectory, visibility, query_points_i, device
+        )
+        
+        # Storage for ensemble predictions (if verifier is present)
+        ensemble_tracks_list = []
+        ensemble_visibility_list = []
+        
+        # Evaluate each model (except verifier)
+        model_metrics = {}
+        for model_name, model in models.items():
+            # Check cache first
+            cache_path = None
+            if cache_predictions and cache_dir and dataset_name:
+                cache_path = os.path.join(cache_dir, dataset_name, model_name, f"{j:06d}.npz")
+                if os.path.exists(cache_path):
+                    # Load from cache
+                    cached = np.load(cache_path)
+                    pred_trajectory = torch.from_numpy(cached['tracks']).to(device)
+                    pred_visibility = torch.from_numpy(cached['visibility']).to(device)
+                else:
+                    # Run model
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+                    # Save to cache
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    np.savez(cache_path, 
+                            tracks=pred_trajectory.cpu().numpy(), 
+                            visibility=pred_visibility.cpu().numpy())
+            else:
+                # Run model without caching
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+            
+            # Store predictions for verifier / oracle / random (keep on CPU to save GPU memory)
+            if has_verifier or has_oracle or has_random:
+                ensemble_tracks_list.append(pred_trajectory.clone().cpu())  # (B, T, N, 2)
+                ensemble_visibility_list.append(pred_visibility.clone().cpu())  # (B, T, N)
 
-        pred_trajectory, pred_visibility = model(video, queries)
+            # Convert predictions to evaluation format
+            pred_occluded = torch.logical_not(pred_visibility.clone().permute(0, 2, 1)).cpu().numpy()
+            pred_tracks = pred_trajectory.permute(0, 2, 1, 3).cpu().numpy()
+            
+            # Compute metrics
+            out_metrics = compute_tapvid_metrics(
+                query_points, gt_occluded, gt_tracks, pred_occluded, pred_tracks, "first"
+            )
+            model_metrics[model_name] = out_metrics
+        
+        # If verifier is present, run it with ensemble predictions
+        if has_verifier:
+            # Stack ensemble predictions and move to device
+            ensemble_tracks = torch.stack(ensemble_tracks_list, dim=-2).to(device)  # (B, T, N, M, 2)
+            ensemble_visibility = torch.stack(ensemble_visibility_list, dim=-1).to(device)  # (B, T, N, M)
+            
+            # Run verifier
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                pred_trajectory, pred_visibility = verifier(
+                    video.clone(), 
+                    queries.clone(), 
+                    ensemble_tracks, 
+                    ensemble_visibility
+                )
+            
+            # Convert predictions to evaluation format
+            pred_occluded = torch.logical_not(pred_visibility.clone().permute(0, 2, 1)).cpu().numpy()
+            pred_tracks = pred_trajectory.permute(0, 2, 1, 3).cpu().numpy()
+            
+            # Compute metrics for verifier
+            out_metrics = compute_tapvid_metrics(
+                query_points, gt_occluded, gt_tracks, pred_occluded, pred_tracks, "first"
+            )
+            model_metrics['verifier'] = out_metrics
 
-        # === === ===
-        # From CoTracker
-        traj = trajectory.clone()
-        query_points = query_points_i.clone().cpu().numpy()
-        gt_tracks = traj.permute(0, 2, 1, 3).cpu().numpy()
-        gt_occluded = torch.logical_not(visibility.clone().permute(0, 2, 1)).cpu().numpy()
-        pred_occluded = torch.logical_not(pred_visibility.clone().permute(0, 2, 1)).cpu().numpy()
-        pred_tracks = pred_trajectory.permute(0, 2, 1, 3).cpu().numpy()
-        # === === ===
+        # Compute oracle: per-track, per-timestep best prediction across all models
+        if has_oracle:
+            oracle_tracks, oracle_visibility = compute_oracle_prediction(
+                ensemble_tracks_list, ensemble_visibility_list, trajectory, visibility
+            )
+            oracle_tracks = oracle_tracks.to(device)
+            oracle_visibility = oracle_visibility.to(device)
+            pred_occluded = torch.logical_not(oracle_visibility.permute(0, 2, 1)).cpu().numpy()
+            pred_tracks_oracle = oracle_tracks.permute(0, 2, 1, 3).cpu().numpy()
+            model_metrics['oracle'] = compute_tapvid_metrics(
+                query_points, gt_occluded, gt_tracks, pred_occluded, pred_tracks_oracle, "first"
+            )
 
-        out_metrics = compute_tapvid_metrics(query_points, gt_occluded, gt_tracks, pred_occluded, pred_tracks, "first")
+        # Compute random: round-robin model selection z = j % M
+        if has_random:
+            M = len(ensemble_tracks_list)
+            z = j % M
+            rand_tracks = ensemble_tracks_list[z].to(device)
+            rand_visibility = ensemble_visibility_list[z].to(device)
+            pred_occluded = torch.logical_not(rand_visibility.permute(0, 2, 1)).cpu().numpy()
+            pred_tracks_rand = rand_tracks.permute(0, 2, 1, 3).cpu().numpy()
+            model_metrics['random'] = compute_tapvid_metrics(
+                query_points, gt_occluded, gt_tracks, pred_occluded, pred_tracks_rand, "first"
+            )
+
+        # Update evaluator
+        evaluator.update(model_metrics)
+        
+        # Print per-sample summary
         if print_each:
-            print(f"Video {j}/{len(dataloader)}: AJ: {out_metrics['average_jaccard'][0] * 100:.2f}, delta_avg: {out_metrics['average_pts_within_thresh'][0] * 100:.2f}, OA: {out_metrics['occlusion_accuracy'][0] * 100:.2f}", flush=True)
-        evaluator.update(out_metrics)
+            print(evaluator.get_sample_summary(j + 1, len(dataloader)), flush=True)
 
+    # Print final results
     evaluator.get_results(-1, log_to_wandb=False)
 
+
 @torch.no_grad()
-def evaluate_dr(model, dataloader, print_each=True):
-    metrics = {}
+def evaluate_dr(models, dataloader, print_each=True, cache_predictions=False, cache_dir=None, dataset_name=None):
+    """Evaluate multiple models on Dynamic Replica dataset
+    
+    Args:
+        models: dict mapping model_name -> model or single model
+        dataloader: Dynamic Replica dataloader
+        print_each: whether to print per-sample metrics
+    """
+    # Handle single model or dict of models
+    if not isinstance(models, dict):
+        models = {'model': models}
+    
+    # Check if verifier / oracle / random are in the models
+    has_verifier = 'verifier' in models
+    if has_verifier:
+        verifier = models.pop('verifier')  # Remove verifier, will run it last
+    has_oracle = 'oracle' in models
+    if has_oracle:
+        models.pop('oracle')  # Oracle has no model; computed from other predictions
+    has_random = 'random' in models
+    if has_random:
+        models.pop('random')  # Random has no model; computed from other predictions
+
+    model_names = list(models.keys())
+    if has_verifier:
+        model_names.append('verifier')  # Add verifier to evaluated models
+    if has_oracle:
+        model_names.append('oracle')  # Oracle upper bound
+    if has_random:
+        model_names.append('random')  # Round-robin random baseline
+
+    evaluator = DREvaluator(model_names)
+    
     with torch.no_grad():
         for ind, (video, traj_2d, visibility) in enumerate(dataloader):
             trajectory = traj_2d.cuda(non_blocking=True)              # (1, T, N, 2)
@@ -118,102 +278,135 @@ def evaluate_dr(model, dataloader, print_each=True):
 
             device = video.device
             queries = torch.cat([torch.zeros_like(trajectory[:, 0, :, :1]), trajectory[:, 0]], dim=2).to(device)
-            seq_name = str(ind)
-        
-            pred_trajectory, pred_visibility = model(video, queries)
             
-            # Evaluate
-            *_, N, _ = trajectory.shape
-            B, T, N = visibility.shape
-            H, W = video.shape[-2:]
-            device = video.device
+            # Storage for ensemble predictions (if verifier is present)
+            ensemble_tracks_list = []
+            ensemble_visibility_list = []
+            
+            # Evaluate each model (except verifier)
+            model_metrics = {}
+            for model_name, model in models.items():
+                # Check cache first
+                cache_path = None
+                if cache_predictions and cache_dir and dataset_name:
+                    cache_path = os.path.join(cache_dir, dataset_name, model_name, f"{ind:06d}.npz")
+                    if os.path.exists(cache_path):
+                        # Load from cache
+                        cached = np.load(cache_path)
+                        pred_trajectory = torch.from_numpy(cached['tracks']).to(device)
+                        pred_visibility = torch.from_numpy(cached['visibility']).to(device)
+                    else:
+                        # Run model
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+                        # Save to cache
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        np.savez(cache_path, 
+                                tracks=pred_trajectory.cpu().numpy(), 
+                                visibility=pred_visibility.cpu().numpy())
+                else:
+                    # Run model without caching
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+                
+                # Store predictions for verifier / oracle / random (keep on CPU to save GPU memory)
+                if has_verifier or has_oracle or has_random:
+                    ensemble_tracks_list.append(pred_trajectory.clone().cpu())  # (B, T, N, 2)
+                    ensemble_visibility_list.append(pred_visibility.clone().cpu())  # (B, T, N)
 
-            out_metrics = {}
 
-            d_vis_sum = d_occ_sum = d_sum_all = 0.0
-            thrs = [1, 2, 4, 8, 16]
-            sx_ = (W - 1) / 255.0
-            sy_ = (H - 1) / 255.0
-            sc_py = np.array([sx_, sy_]).reshape([1, 1, 2])
-            sc_pt = torch.from_numpy(sc_py).float().to(device)
-            __, first_visible_inds = torch.max(visibility, dim=1)
+                pred_trajectory = pred_trajectory.to(device)
+                pred_visibility = pred_visibility.to(device)
+                
+                # Calculate metrics
+                out_metrics = compute_dr_metrics(pred_trajectory, pred_visibility, trajectory, visibility, H, W, device)
+                model_metrics[model_name] = out_metrics
+            
+            # If verifier is present, run it with ensemble predictions
+            if has_verifier:
+                # Stack ensemble predictions and move to device
+                ensemble_tracks = torch.stack(ensemble_tracks_list, dim=-2).to(device)  # (B, T, N, M, 2)
+                ensemble_visibility = torch.stack(ensemble_visibility_list, dim=-1).to(device)  # (B, T, N, M)
+                
+                # Run verifier
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred_trajectory, pred_visibility = verifier(
+                        video.clone(), 
+                        queries.clone(), 
+                        ensemble_tracks, 
+                        ensemble_visibility)
+                    
+                    pred_trajectory = pred_trajectory.to(device)
+                    pred_visibility = pred_visibility.to(device)
+                    
+                
+                # Calculate metrics for verifier
+                out_metrics = compute_dr_metrics(pred_trajectory, pred_visibility, trajectory, visibility, H, W, device)
+                model_metrics['verifier'] = out_metrics
 
-            frame_ids_tensor = torch.arange(T, device=device)[None, :, None].repeat(B, 1, N)
-            start_tracking_mask = frame_ids_tensor > (first_visible_inds.unsqueeze(1))
-
-            for thr in thrs:
-                d_ = (
-                    torch.norm(
-                        pred_trajectory[..., :2] / sc_pt
-                        - trajectory[..., :2] / sc_pt,
-                        dim=-1,
-                    )
-                    < thr
-                ).float()  # B,S-1,N
-                d_occ = (
-                    reduce_masked_mean(
-                        d_, (1 - visibility) * start_tracking_mask
-                    ).item()
-                    * 100.0
+            # Compute oracle: per-track, per-timestep best prediction across all models
+            if has_oracle:
+                oracle_tracks, oracle_visibility = compute_oracle_prediction(
+                    ensemble_tracks_list, ensemble_visibility_list, trajectory, visibility
                 )
-                d_occ_sum += d_occ
-                out_metrics[f"accuracy_occ_{thr}"] = d_occ
-
-                d_vis = (
-                    reduce_masked_mean(
-                        d_, visibility * start_tracking_mask
-                    ).item()
-                    * 100.0
+                oracle_tracks = oracle_tracks.to(device)
+                oracle_visibility = oracle_visibility.to(device)
+                model_metrics['oracle'] = compute_dr_metrics(
+                    oracle_tracks, oracle_visibility, trajectory, visibility, H, W, device
                 )
-                d_vis_sum += d_vis
-                out_metrics[f"accuracy_vis_{thr}"] = d_vis
 
-                d_all = reduce_masked_mean(d_, start_tracking_mask).item() * 100.0
-                d_sum_all += d_all
-                out_metrics[f"accuracy_{thr}"] = d_all
-
-            d_occ_avg = d_occ_sum / len(thrs)
-            d_vis_avg = d_vis_sum / len(thrs)
-            d_all_avg = d_sum_all / len(thrs)
-
-            sur_thr = 50
-            dists = torch.norm(
-                pred_trajectory[..., :2] / sc_pt - trajectory[..., :2] / sc_pt,
-                dim=-1,
-            )  # B,S,N
-            dist_ok = 1 - (dists > sur_thr).float() * visibility  # B,S,N
-            survival = torch.cumprod(dist_ok, dim=1)  # B,S,N
-            out_metrics["survival"] = torch.mean(survival).item() * 100.0
-
-            out_metrics["accuracy_occ"] = d_occ_avg
-            out_metrics["accuracy_vis"] = d_vis_avg
-            out_metrics["accuracy"] = d_all_avg
-
-            metrics[seq_name] = out_metrics
-            for metric_name in out_metrics.keys():
-                if "avg" not in metrics:
-                    metrics["avg"] = {}
-                metrics["avg"][metric_name] = float(
-                    np.mean([v[metric_name] for k, v in metrics.items() if k != "avg"])
+            # Compute random: round-robin model selection z = ind % M
+            if has_random:
+                M = len(ensemble_tracks_list)
+                z = ind % M
+                rand_tracks = ensemble_tracks_list[z].to(device)
+                rand_visibility = ensemble_visibility_list[z].to(device)
+                model_metrics['random'] = compute_dr_metrics(
+                    rand_tracks, rand_visibility, trajectory, visibility, H, W, device
                 )
+
+            evaluator.update(model_metrics)
 
             if print_each:
-                print(f"Sequence {ind}/{len(dataloader)}: delta_avg: {out_metrics['accuracy']:.2f}, delta_vis: {out_metrics['accuracy_vis']:.2f}, delta_occ: {out_metrics['accuracy_occ']:.2f}, survival: {out_metrics['survival']:.2f}", flush=True)
+                print(evaluator.get_sample_summary(ind + 1, len(dataloader)), flush=True)
 
-    print()
-    for metric_name, value in metrics["avg"].items():
-        print(f"{metric_name}: {value:.2f}")
-    print()
-
+    evaluator.get_results(-1, log_to_wandb=False)
 
 
 @torch.no_grad()
-def evaluate_po(model, dataloader, print_each=True):
-    d_vis_all = []
-    d_all = []
-    survival_all = []
-    median_l2_all = []
-    median_vis_l2_all = []
+def evaluate_po(models, dataloader, print_each=True, cache_predictions=False, cache_dir=None, dataset_name=None):
+    """Evaluate multiple models on Point Odyssey dataset
+    
+    Args:
+        models: dict mapping model_name -> model or single model
+        dataloader: Point Odyssey dataloader
+        print_each: whether to print per-sample metrics
+    """
+    # Handle single model or dict of models
+    if not isinstance(models, dict):
+        models = {'model': models}
+    
+    # Check if verifier / oracle / random are in the models
+    has_verifier = 'verifier' in models
+    if has_verifier:
+        verifier = models.pop('verifier')  # Remove verifier, will run it last
+    has_oracle = 'oracle' in models
+    if has_oracle:
+        models.pop('oracle')  # Oracle has no model; computed from other predictions
+    has_random = 'random' in models
+    if has_random:
+        models.pop('random')  # Random has no model; computed from other predictions
+
+    model_names = list(models.keys())
+    if has_verifier:
+        model_names.append('verifier')  # Add verifier to evaluated models
+    if has_oracle:
+        model_names.append('oracle')  # Oracle upper bound
+    if has_random:
+        model_names.append('random')  # Round-robin random baseline
+
+    evaluator = POEvaluator(model_names)
+    
     with torch.no_grad():
         for j, sample in enumerate(dataloader):
 
@@ -260,68 +453,249 @@ def evaluate_po(model, dataloader, print_each=True):
             first_visible_points = trajectory[0, time_indices, torch.arange(trajectory.shape[2])] # (N, 2)
             queries = torch.cat([first_visible_inds.unsqueeze(-1), first_visible_points.unsqueeze(0)], dim=2).to(device)  # (1, N, 3)
             
-            trajs_e, pred_visibility = model(video, queries)
+            # Storage for ensemble predictions (if verifier is present)
+            ensemble_tracks_list = []
+            ensemble_visibility_list = []
             
-            metrics = {}
-            S = T
-            EPS = 1e-6
-            d_sum = 0.0
-            d_vis_sum = 0.0
-            thrs = [1,2,4,8,16]
-            sx_ = W / 256.0
-            sy_ = H / 256.0
-            sc_py = np.array([sx_, sy_]).reshape([1,1,2])
-            sc_pt = torch.from_numpy(sc_py).float().cuda()
-            __, first_visible_inds = torch.max(visibility, dim=1)
-            frame_ids_tensor = torch.arange(T, device=device)[None, :, None].repeat(B, 1, N)
-            start_tracking_mask = frame_ids_tensor > (first_visible_inds.unsqueeze(1))
-            
-            for thr in thrs:
-                # note we exclude timestep0 from this eval
-                d__ = (torch.norm(trajs_e[:,1:]/sc_pt - trajectory[:,1:]/sc_pt, dim=-1) < thr).float() # B,S-1,N
-                d_ = reduce_masked_mean(d__, valids[:,1:]).item()*100.0
-                d_sum += d_
-                metrics['d_%d' % thr] = d_
-
-                d_vis = reduce_masked_mean(d__, visibility[:,1:] * start_tracking_mask[:,1:]).item() * 100.0
-                d_vis_sum += d_vis
-                metrics[f"d_vis_{thr}"] = d_vis
+            # Evaluate each model (except verifier)
+            model_metrics = {}
+            for model_name, model in models.items():
+                # Check cache first
+                cache_path = None
+                if cache_predictions and cache_dir and dataset_name:
+                    cache_path = os.path.join(cache_dir, dataset_name, model_name, f"{j:06d}.npz")
+                    if os.path.exists(cache_path):
+                        # Load from cache
+                        cached = np.load(cache_path)
+                        pred_trajectory = torch.from_numpy(cached['tracks']).to(device)
+                        pred_visibility = torch.from_numpy(cached['visibility']).to(device)
+                    else:
+                        # Run model
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+                        # Save to cache
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        np.savez(cache_path, 
+                                tracks=pred_trajectory.cpu().numpy(), 
+                                visibility=pred_visibility.cpu().numpy())
+                else:
+                    # Run model without caching
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
                 
-            d_avg = d_sum / len(thrs)
-            d_vis_avg = d_vis_sum / len(thrs)
-            metrics['d_avg'] = d_avg
-            metrics['d_vis_avg'] = d_vis_avg
-            
-            sur_thr = 50
-            dists = torch.norm(trajs_e/sc_pt - trajectory/sc_pt, dim=-1) # B,S,N
-            dist_ok = 1 - (dists > sur_thr).float() * visibility # B,S,N
-            
-            survival = torch.cumprod(dist_ok, dim=1) # B,S,N
-            metrics['survival'] = torch.mean(survival).item()*100.0
-            
-            # get the median l2 error for each trajectory
-            dists_ = dists.permute(0,2,1).reshape(B*N,S)
-            valids_ = valids.permute(0,2,1).reshape(B*N,S)
-            visibs_ = visibility.permute(0,2,1).reshape(B*N,S)
-            median_l2 = reduce_masked_median(dists_, valids_, keep_batch=True)
-            median_vis_l2 = reduce_masked_median(dists_, visibs_, keep_batch=True)
-            metrics['median_l2'] = median_l2.mean().item()
-            metrics['median_vis_l2'] = median_vis_l2.mean().item()
+                # Store predictions for verifier / oracle / random (keep on CPU to save GPU memory)
+                if has_verifier or has_oracle or has_random:
+                    ensemble_tracks_list.append(pred_trajectory.clone().cpu())  # (B, T, N, 2)
+                    ensemble_visibility_list.append(pred_visibility.clone().cpu())  # (B, T, N)
 
-            # print(metrics)
+                # Calculate metrics
+                pred_trajectory = pred_trajectory.to(device)
+                pred_visibility = pred_visibility.to(device)
+
+                out_metrics = compute_po_metrics(pred_trajectory, pred_visibility, trajectory, visibility, valids, H, W, device)
+                model_metrics[model_name] = out_metrics
+            
+            # If verifier is present, run it with ensemble predictions
+            if has_verifier:
+                # Stack ensemble predictions and move to device
+                ensemble_tracks = torch.stack(ensemble_tracks_list, dim=-2).to(device)  # (B, T, N, M, 2)
+                ensemble_visibility = torch.stack(ensemble_visibility_list, dim=-1).to(device)  # (B, T, N, M)
+                
+                # Run verifier
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred_trajectory, pred_visibility = verifier(
+                        video.clone(), 
+                        queries.clone(), 
+                        ensemble_tracks, 
+                        ensemble_visibility
+                    )
+
+                    pred_trajectory = pred_trajectory.to(device)
+                    pred_visibility = pred_visibility.to(device)
+                
+                # Calculate metrics for verifier
+                out_metrics = compute_po_metrics(pred_trajectory, pred_visibility, trajectory, visibility, valids, H, W, device)
+                model_metrics['verifier'] = out_metrics
+
+            # Compute oracle: per-track, per-timestep best prediction across all models
+            if has_oracle:
+                oracle_tracks, oracle_visibility = compute_oracle_prediction(
+                    ensemble_tracks_list, ensemble_visibility_list, trajectory, visibility
+                )
+                oracle_tracks = oracle_tracks.to(device)
+                oracle_visibility = oracle_visibility.to(device)
+                model_metrics['oracle'] = compute_po_metrics(
+                    oracle_tracks, oracle_visibility, trajectory, visibility, valids, H, W, device
+                )
+
+            # Compute random: round-robin model selection z = j % M
+            if has_random:
+                M = len(ensemble_tracks_list)
+                z = j % M
+                rand_tracks = ensemble_tracks_list[z].to(device)
+                rand_visibility = ensemble_visibility_list[z].to(device)
+                model_metrics['random'] = compute_po_metrics(
+                    rand_tracks, rand_visibility, trajectory, visibility, valids, H, W, device
+                )
+
+            evaluator.update(model_metrics)
+
             if print_each:
-                print(f"d_avg: {d_avg:.1f}    d_vis_avg: {d_vis_avg:.1f}    survival: {torch.mean(survival).item()*100.0:.1f}    median_l2: {median_l2.mean().item():.1f}    median_vis_l2: {median_vis_l2.mean().item():.1f}", flush=True)
-            
-            survival_all.append(metrics['survival'])
-            d_vis_all.append(metrics['d_vis_avg'])
-            d_all.append(metrics['d_avg'])
-            median_l2_all.append(metrics['median_l2'])
-            median_vis_l2_all.append(metrics['median_vis_l2'])
+                print(evaluator.get_sample_summary(j + 1, len(dataloader)), flush=True)
 
-    print()
-    print(f"d_avg: {sum(d_all) / len(d_all)}")   
-    print(f"d_vis_avg: {sum(d_vis_all) / len(d_vis_all)}")
-    print(f"survival: {sum(survival_all) / len(survival_all)}")
-    print(f"median_l2: {sum(median_l2_all) / len(median_l2_all)}")
-    print(f"median_vis_l2: {sum(median_vis_l2_all) / len(median_vis_l2_all)}")
+    evaluator.get_results(-1, log_to_wandb=False)
+
+
+@torch.no_grad()
+def evaluate_ego_points(models, dataloader, print_each=True, cache_predictions=False, cache_dir=None, dataset_name=None):
+    """Evaluate multiple models on Ego Points dataset
+    
+    Args:
+        models: dict mapping model_name -> model or single model
+        dataloader: Ego Points dataloader
+        print_each: whether to print per-sample metrics
+    """
+    # Handle single model or dict of models
+    if not isinstance(models, dict):
+        models = {'model': models}
+    
+    # Check if verifier / oracle / random are in the models
+    has_verifier = 'verifier' in models
+    if has_verifier:
+        verifier = models.pop('verifier')  # Remove verifier, will run it last
+    has_oracle = 'oracle' in models
+    if has_oracle:
+        models.pop('oracle')  # Oracle has no model; computed from other predictions
+    has_random = 'random' in models
+    if has_random:
+        models.pop('random')  # Random has no model; computed from other predictions
+
+    model_names = list(models.keys())
+    if has_verifier:
+        model_names.append('verifier')  # Add verifier to evaluated models
+    if has_oracle:
+        model_names.append('oracle')  # Oracle upper bound
+    if has_random:
+        model_names.append('random')  # Round-robin random baseline
+
+    evaluator = EgoPointsEvaluator(model_names)
+
+    with torch.no_grad():
+        for j, sample in enumerate(dataloader):
+            trajectory = sample['trajectory'].cuda(non_blocking=True)  # (1, T, N, 2)
+            video = sample['video'].cuda(non_blocking=True)  # (1, T, 3, H, W)
+            visibility = sample['visibility'].cuda(non_blocking=True)  # (1, T, N)
+            valids = sample['valids'].cuda(non_blocking=True)  # (1, T, N)
+            vis_valids = sample['vis_valids'].cuda(non_blocking=True)  # (1, T, N)
+            out_of_view = sample['out_of_view'].cuda(non_blocking=True)  # (1, T, N)
+            occluded = sample['occluded'].cuda(non_blocking=True)  # (1, T, N)
+            seq = sample['seq'][0]
+            
+            B, T, N, _ = trajectory.shape
+            _, _, _, H, W = video.shape
+            device = video.device
+            
+            # Create queries from first frame positions (t=0, x, y)
+            queries = torch.cat([torch.zeros_like(trajectory[:, 0, :, :1]), trajectory[:, 0]], dim=2).to(device)  # (1, N, 3)
+
+            # Storage for ensemble predictions (if verifier is present)
+            ensemble_tracks_list = []
+            ensemble_visibility_list = []
+
+            # Evaluate each model (except verifier)
+            model_metrics = {}
+            for model_name, model in models.items():
+                # Check cache first
+                cache_path = None
+                if cache_predictions and cache_dir and dataset_name:
+                    cache_path = os.path.join(cache_dir, dataset_name, model_name, f"{j:06d}.npz")
+                    if os.path.exists(cache_path):
+                        # Load from cache
+                        cached = np.load(cache_path)
+                        pred_trajectory = torch.from_numpy(cached['tracks']).to(device)
+                        pred_visibility = torch.from_numpy(cached['visibility']).to(device)
+                    else:
+                        # Run model
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+
+                        # Save to cache
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        np.savez(cache_path, 
+                                tracks=pred_trajectory.cpu().numpy(), 
+                                visibility=pred_visibility.cpu().numpy())
+                else:
+                    # Run model without caching
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        pred_trajectory, pred_visibility = model(video.clone(), queries.clone())
+
+                
+                # Store predictions for verifier / oracle / random (keep on CPU to save GPU memory)
+                if has_verifier or has_oracle or has_random:
+                    ensemble_tracks_list.append(pred_trajectory.clone().cpu())  # (B, T, N, 2)
+                    ensemble_visibility_list.append(pred_visibility.clone().cpu())  # (B, T, N)
+
+                pred_trajectory = pred_trajectory.to(device)
+                pred_visibility = pred_visibility.to(device)
+
+                # Calculate metrics
+                out_metrics = compute_ego_points_metrics(
+                    pred_trajectory, pred_visibility, trajectory, visibility, 
+                    valids, vis_valids, out_of_view, occluded, H, W, device
+                )
+                model_metrics[model_name] = out_metrics
+            
+            # If verifier is present, run it with ensemble predictions
+            if has_verifier:
+                # Stack ensemble predictions and move to device
+                ensemble_tracks = torch.stack(ensemble_tracks_list, dim=-2).to(device)  # (B, T, N, M, 2)
+                ensemble_visibility = torch.stack(ensemble_visibility_list, dim=-1).to(device)  # (B, T, N, M)
+                
+                # Run verifier
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pred_trajectory, pred_visibility = verifier(
+                        video.clone(), 
+                        queries.clone(), 
+                        ensemble_tracks, 
+                        ensemble_visibility
+                    )
+                    pred_trajectory = pred_trajectory.to(device)
+                    pred_visibility = pred_visibility.to(device)
+                
+                # Calculate metrics for verifier
+                out_metrics = compute_ego_points_metrics(
+                    pred_trajectory, pred_visibility, trajectory, visibility, 
+                    valids, vis_valids, out_of_view, occluded, H, W, device
+                )
+                model_metrics['verifier'] = out_metrics
+
+            # Compute oracle: per-track, per-timestep best prediction across all models
+            if has_oracle:
+                oracle_tracks, oracle_visibility = compute_oracle_prediction(
+                    ensemble_tracks_list, ensemble_visibility_list, trajectory, visibility
+                )
+                oracle_tracks = oracle_tracks.to(device)
+                oracle_visibility = oracle_visibility.to(device)
+                model_metrics['oracle'] = compute_ego_points_metrics(
+                    oracle_tracks, oracle_visibility, trajectory, visibility,
+                    valids, vis_valids, out_of_view, occluded, H, W, device
+                )
+
+            # Compute random: round-robin model selection z = j % M
+            if has_random:
+                M = len(ensemble_tracks_list)
+                z = j % M
+                rand_tracks = ensemble_tracks_list[z].to(device)
+                rand_visibility = ensemble_visibility_list[z].to(device)
+                model_metrics['random'] = compute_ego_points_metrics(
+                    rand_tracks, rand_visibility, trajectory, visibility,
+                    valids, vis_valids, out_of_view, occluded, H, W, device
+                )
+
+            evaluator.update(model_metrics)
+            
+            if print_each:
+                print(evaluator.get_sample_summary(j + 1, len(dataloader)), flush=True)
+
+    evaluator.get_results(-1, log_to_wandb=False)
 

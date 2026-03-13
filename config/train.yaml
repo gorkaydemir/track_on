@@ -1,4 +1,9 @@
 eval_dataset: "davis"
+movi_f_root: /path/to/movi-f/dataset     # TODO: set path to TAP-Vid Kubric Movi-F dataset (see dataset/README.md)
+tapvid_root: /path/to/tapvid/davis/pkl  # TODO: set path to tapvid_davis.pkl
+
+checkpoint_path: null # if None, will not load any checkpoint and start training from scratch
+model_save_path: "checkpoints/track_on2"
 
 frame_sampling: "uniform"
 frame_sample_ratio: 2.0
@@ -24,8 +29,8 @@ lambda_patch_cls: 3.0
 
 evaluation: False
 epoch_num: 200
-lr: 0.0005 # 5e-4
-wd: 0.00001   # 1e-5
+lr: 0.0005
+wd: 0.00001
 bs: 1
 grad_checkpoint: True
 amp: True

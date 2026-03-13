@@ -1,4 +1,3 @@
-
 import warnings
 import torch
 from math import isnan
@@ -82,7 +81,7 @@ class Loss_Tracker:
 
 def init_wandb(args):
     if args.rank == 0:
-        project_name = "Track-On2"
+        project_name = "Track-On-R"
         run_name = args.model_save_path.split("/")[-1]
         wandb.init(project=project_name, name=run_name, config=args)
 
@@ -114,3 +113,19 @@ def init_wandb(args):
         wandb.define_metric("Training/uncertainty_loss", step_metric="iteration")
         wandb.define_metric("Training/topk_uncertainty_loss", step_metric="iteration")
         wandb.define_metric("Training/topk_rank_loss", step_metric="iteration")
+
+def init_wandb_verifier(args):
+    if args.rank == 0:
+        project_name = "Track-On-R"
+        run_name = args.model_save_path.split("/")[-1]
+        wandb.init(project=project_name, name=run_name, config=args)
+
+        wandb.define_metric("epoch")
+        wandb.define_metric("Training/epoch_loss", step_metric="epoch")
+
+        wandb.define_metric("Evaluation/delta_avg", step_metric="epoch")
+        wandb.define_metric("Evaluation/oa", step_metric="epoch")
+
+        wandb.define_metric("iteration")
+        wandb.define_metric("Training/ranking_loss", step_metric="iteration")
+        wandb.define_metric("Training/delta_best_pred", step_metric="iteration")

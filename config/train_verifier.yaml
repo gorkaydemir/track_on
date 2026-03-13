@@ -1,0 +1,40 @@
+# Datasets
+eval_dataset: "davis"
+epic_k_path: /path/to/epic-k/dataset/k_epic/train  # TODO: set path to K-Epic train split (see dataset/README.md)
+tapvid_root: /path/to/tapvid/davis/pkl              # TODO: set path to tapvid_davis.pkl
+
+# Ensemble Models (used for optional per-epoch evaluation; paths can be omitted if evaluation is not needed)
+trackon2_config_path: "./config/test.yaml"
+trackon2_checkpoint_path: /path/to/trackon2/checkpoint.pt        # TODO: set path to Track-On2 checkpoint
+bootstapnext_checkpoint_path: /path/to/bootstapnext/checkpoint.pt  # TODO: set path to BootsTAPNext checkpoint
+bootstapir_checkpoint_path: /path/to/bootstapir/checkpoint.pt      # TODO: set path to BootsTAPIR checkpoint
+
+# Checkpoint Path
+checkpoint_path: null # if None, will not load any checkpoint and start training from scratch
+model_save_path: "checkpoints/verifier"
+
+# Model Parameters
+verifier_input_size: [384, 512]
+verifier_embedding_dim: 256
+verifier_num_layers: 6
+local_encoder_num_layers: 3
+query_critic: "feature"  # "feature", "none"
+
+# Training data parameters
+input_size: [384, 512]
+N: 384
+T: 24
+acceptance_threshold: 8.0
+
+# Loss Parameters
+lambda_rank: 5.0
+soft_rank_target: True
+
+# Misc
+cache_ensemble: True
+epoch_num: 100
+lr: 0.0005
+wd: 0.001
+bs: 1
+amp: True
+seed: 1234

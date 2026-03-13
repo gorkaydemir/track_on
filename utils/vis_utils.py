@@ -567,7 +567,7 @@ def save_video(frames, path, fps=10, codec="mp4v"):
     print(f"Video saved to {path}")
 
 
-def vis(video, tracks, visibles, N=None, calc_homogs=True):
+def vis(video, tracks, visibles, N=None, calc_homogs=True, point_size=64):
     # :args video: (T, H, W, 3) in range [0, 255]
     # :args tracks: (T, N, 2) in range [0, W] and [0, H], torch
     # :args visibles: (T, N), bool, torch
@@ -617,7 +617,7 @@ def vis(video, tracks, visibles, N=None, calc_homogs=True):
 
 
     video = plot_tracks_tails(
-        video, tracks[is_fg], occluded[is_fg], homogs, point_size=64, linewidth=1.0
+        video, tracks[is_fg], occluded[is_fg], homogs, point_size=point_size, linewidth=1.0
     )
 
     return video

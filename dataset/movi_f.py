@@ -379,7 +379,7 @@ class Movi_F_Large(Movi_F_Base):
         self.T = args.T
         self.N = args.N
     
-        self.seq_names = [fname for fname in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, fname))]
+        self.seq_names = [fname for fname in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, fname)) and not fname.startswith(".")]
         self.seq_names = sorted(self.seq_names)
 
 

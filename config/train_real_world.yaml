@@ -1,0 +1,43 @@
+# Fine-tuned + Ensemble Track-On
+trackon2_config_path: "./config/test.yaml"
+trackon2_checkpoint_path: /path/to/trackon2/checkpoint.pt  # TODO: set path to Track-On2 checkpoint
+
+# Datasets
+eval_dataset: "davis"
+rw_dataset_path: /path/to/real-world/dataset  # TODO: set path to TAO real-world dataset (see dataset/README.md)
+tapvid_root: /path/to/tapvid/davis/pkl         # TODO: set path to tapvid_davis.pkl
+movi_f_root: /path/to/movi-f/dataset           # TODO: set path to Movi-F dataset (required if syn_real_training: True)
+use_ovis: True
+use_vspw: True
+syn_real_training: True
+schedule_syn_weight: True
+
+# Additional Ensemble Models
+bootstapnext_checkpoint_path: /path/to/bootstapnext/checkpoint.pt          # TODO: set path to BootsTAPNext checkpoint
+bootstapir_checkpoint_path: /path/to/bootstapir/checkpoint.pt              # TODO: set path to BootsTAPIR checkpoint
+anthro_locotrack_checkpoint_path: /path/to/anthro_locotrack/checkpoint.pt  # TODO: set path to Anthro-LocoTrack checkpoint
+alltracker_checkpoint_path: /path/to/alltracker/checkpoint.pt              # TODO: set path to AllTracker checkpoint
+
+# Verifier
+verifier_config_path: "./config/train_verifier.yaml"
+verifier_checkpoint_path: /path/to/verifier/checkpoint.pt  # TODO: set path to trained verifier checkpoint
+# Checkpoint Path
+checkpoint_path: null # if None, will not load any checkpoint and start training from scratch
+model_save_path: "checkpoints/track_on_r"
+
+# Training Parameters
+random_teacher: False
+input_size: [384, 512]
+T: 48
+N: 256
+frame_sample_ratio: 2.0
+frame_sampling: "uniform"
+delta_v: 0.8
+lambda_patch_cls: 3.0
+
+epoch_num: 30
+lr: 0.00003
+wd: 0.00001
+bs: 1
+amp: True
+seed: 1234

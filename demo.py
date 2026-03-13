@@ -23,19 +23,18 @@ from torchvision.io import read_video
 from model.trackon_predictor import Predictor
 from utils.train_utils import load_args_from_yaml
 from utils.vis_utils import plot_tracks_wo_tail, save_video
-from evaluation.evaluator import get_points_on_a_grid 
+from utils.coord_utils import get_points_on_a_grid 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Track-On2 demo")
     p.add_argument("--video", required=True, type=str, help="Path to input video (e.g., .mp4)")
-    p.add_argument("--config", default="./config/test.yaml", type=str, help="Path to model config .yaml")
+    p.add_argument("--config", default=None, type=str, help="Path to model config .yaml")
     p.add_argument("--ckpt", required=True, type=str, help="Path to Track-On2 checkpoint .pth")
     p.add_argument("--output", default="demo_output.mp4", type=str, help="Path to output visualization video")
     p.add_argument("--use-grid", default=False, type=lambda x: str(x).lower() in {"1","true","yes","y"},
                    help="If true, uses a uniform grid of queries.")
     p.add_argument("--point-size", default=100, type=int, help="Dot size for visualization.")
     return p.parse_args()
-
 
 def pick_device() -> str:
     if torch.cuda.is_available():
@@ -54,7 +53,7 @@ def load_video_thwc(path: str) -> torch.Tensor:
 def ensure_paths(args: argparse.Namespace) -> None:
     if not os.path.isfile(args.video):
         sys.exit(f"[ERROR] Video not found: {args.video}")
-    if not os.path.isfile(args.config):
+    if args.config is not None and not os.path.isfile(args.config):
         sys.exit(f"[ERROR] Config not found: {args.config}")
     if not os.path.isfile(args.ckpt):
         sys.exit(f"[ERROR] Checkpoint not found: {args.ckpt}")
@@ -110,7 +109,11 @@ def main() -> None:
 
     # === Initialize the model ===
     print(f"[Info] Loading model config: {args.config}")
-    model_args = load_args_from_yaml(args.config)
+    if args.config is None:
+        # If no config is provided, default arguments are set in Predictor class.
+        model_args = None
+    else:
+        model_args = load_args_from_yaml(args.config)
 
     print(f"[Info] Initializing model with checkpoint: {args.ckpt}")
     model = Predictor(model_args, checkpoint_path=args.ckpt, support_grid_size=0).to(device).eval()
@@ -119,7 +122,7 @@ def main() -> None:
     if args.use_grid:
         queries = build_uniform_grid_queries(
             device,
-            grid_size=32,
+            grid_size=25,
             H=video_tchw.shape[2],
             W=video_tchw.shape[3],
         )

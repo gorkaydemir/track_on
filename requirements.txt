@@ -2,7 +2,10 @@ tqdm==4.67.1
 wandb==0.17.9
 mediapy==1.2.2
 timm==1.0.12
-imageio[ffmpeg]==0.6.0
 transformers==4.56.1
 accelerate==1.10.0
 av==16.0.1
+einshape==1.0
+dm-tree==0.1.9
+imageio==2.37.3
+einops==0.8.2

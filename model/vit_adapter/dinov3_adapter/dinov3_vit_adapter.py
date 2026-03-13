@@ -31,7 +31,10 @@ class ViTAdapter(nn.Module):
         else:
             raise ValueError(f"Unknown arch_type: {arch_type}")
 
-        self.dinov3 = AutoModel.from_pretrained(pretrained_model_name, device_map=None)
+        # NOTE: If you are working in an environment without internet access, 
+        #       make sure to download the pretrained DINOv3 weights to cache (eg with a call on login node)
+        #       and set `local_files_only=True` in the line below for your trainings.
+        self.dinov3 = AutoModel.from_pretrained(pretrained_model_name, device_map=None, local_files_only=False)
         self.patch_size = 16
 
         # Freeze vit

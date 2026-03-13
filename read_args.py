@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+# NOTE: Although all parameters are currently read from the configuration file, this code is retained for convenience and future flexibility.
+
 def get_args():
     parser = argparse.ArgumentParser("Track-On2")
 

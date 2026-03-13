@@ -13,7 +13,7 @@ from dataset.tapvid import TAPVid
 
 def get_args():
     parser = argparse.ArgumentParser(description="Benchmark script for Track-On2")
-    parser.add_argument('--config_path', type=str, required=True, default="./config/test.yaml", help='Path to the model config file')
+    parser.add_argument('--config_path', type=str, default="./config/test.yaml", help='Path to the model config file')
     parser.add_argument('--model_checkpoint_path', type=str, required=True, help='Path to the model checkpoint file')
     parser.add_argument('--davis_path', type=str, required=True, help='Path to the dataset')
     parser.add_argument('--N_sqrt', type=int, default=8, help='Number of queries to use for evaluation')
