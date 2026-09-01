@@ -1,7 +1,11 @@
 # Track-On: Online Point Tracking with Memory
 
-### [Project Page](https://kuis-ai.github.io/track_on_r/) | [Track-On-R](https://arxiv.org/abs/2603.12217) | [Track-On2](https://arxiv.org/abs/2509.19115) | [Track-On](https://arxiv.org/abs/2501.18487) 
+### [Project Page](https://kuis-ai.github.io/track_on_r/) | [Track-On-R (CVPR 26)](https://arxiv.org/abs/2603.12217) | [Track-On2 (TPAMI 26)](https://arxiv.org/abs/2509.19115) | [Track-On (ICLR 25)](https://arxiv.org/abs/2501.18487) 
 
+[![Papers with Code: SOTA on TAP-Vid DAVIS](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge.svg?eval=25536&live=1)](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge-link?eval=25536)
+[![Papers with Code: SOTA on EgoPoints](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge.svg?eval=25534&live=1)](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge-link?eval=25534)
+[![Papers with Code: SOTA on PointOdyssey](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge.svg?eval=28980&live=1)](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge-link?eval=28980)
+[![Papers with Code: SOTA on RoboTAP](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge.svg?eval=25535&live=1)](https://paperswithcode.co/api/v1/papers/2603.12217/leaderboard-badge-link?eval=25535)
 
 Official implementation of the **Track-On family of online point tracking models**.
 
